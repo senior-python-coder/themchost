@@ -1,0 +1,2263 @@
+from fastapi import FastAPI, HTTPException, Form, Request, Depends, Cookie
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
+from typing import Optional
+import sqlite3
+import hashlib
+import uuid
+import requests
+import json
+from datetime import datetime, timedelta
+import secrets
+
+app = FastAPI(title="ThemcHost.uz")
+
+
+# ===================== DATABASE =====================
+def init_db():
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (
+                     id
+                     INTEGER
+                     PRIMARY
+                     KEY
+                     AUTOINCREMENT,
+                     username
+                     TEXT
+                     UNIQUE,
+                     email
+                     TEXT
+                     UNIQUE,
+                     password
+                     TEXT,
+                     balance
+                     REAL
+                     DEFAULT
+                     0,
+                     created_at
+                     TEXT
+                 )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS servers
+                 (
+                     id
+                     INTEGER
+                     PRIMARY
+                     KEY
+                     AUTOINCREMENT,
+                     user_id
+                     INTEGER,
+                     server_name
+                     TEXT,
+                     domain
+                     TEXT,
+                     plan
+                     TEXT,
+                     ram
+                     INTEGER,
+                     cpu
+                     INTEGER,
+                     disk
+                     INTEGER,
+                     pterodactyl_id
+                     TEXT,
+                     status
+                     TEXT
+                     DEFAULT
+                     'active',
+                     created_at
+                     TEXT,
+                     expires_at
+                     TEXT
+                 )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions
+                 (
+                     id
+                     INTEGER
+                     PRIMARY
+                     KEY
+                     AUTOINCREMENT,
+                     user_id
+                     INTEGER,
+                     session_token
+                     TEXT
+                     UNIQUE,
+                     created_at
+                     TEXT
+                 )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS transactions
+                 (
+                     id
+                     INTEGER
+                     PRIMARY
+                     KEY
+                     AUTOINCREMENT,
+                     user_id
+                     INTEGER,
+                     amount
+                     REAL,
+                     type
+                     TEXT,
+                     description
+                     TEXT,
+                     created_at
+                     TEXT
+                 )''')
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+# ===================== CONFIG =====================
+PTERODACTYL_URL = "https://panel.example.com"
+PTERODACTYL_API_KEY = "ptlc_your_api_key_here"
+
+PLANS = {
+    "proxy": {"ram": 2048, "cpu": 70, "disk": 5120, "price": 5000},
+    "rare": {"ram": 4096, "cpu": 100, "disk": 10240, "price": 20000},
+    "pro": {"ram": 8192, "cpu": 200, "disk": 25600, "price": 45000},
+    "boost": {"ram": 12288, "cpu": 300, "disk": 40960, "price": 70000},
+    "boost_plus": {"ram": 16384, "cpu": 300, "disk": 51200, "price": 120000},
+    "forest": {"ram": 20480, "cpu": 400, "disk": 71680, "price": 150000},
+    "forest_plus": {"ram": 24576, "cpu": 500, "disk": 92160, "price": 195000},
+    "vulcan": {"ram": 32768, "cpu": 700, "disk": 112640, "price": 260000}
+}
+
+
+# ===================== AUTH HELPERS =====================
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verify_session(session_token: Optional[str] = Cookie(None)):
+    if not session_token:
+        return None
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+    c.execute('SELECT user_id FROM sessions WHERE session_token = ?', (session_token,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def get_user_by_id(user_id: int):
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM users WHERE id = ?', (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+
+# ===================== PTERODACTYL =====================
+def create_pterodactyl_server(server_name: str, plan: str, email: str):
+    plan_config = PLANS.get(plan)
+    headers = {
+        "Authorization": f"Bearer {PTERODACTYL_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    try:
+        server_data = {
+            "name": server_name,
+            "user": 1,
+            "egg": 1,
+            "docker_image": "ghcr.io/pterodactyl/yolks:java_17",
+            "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}",
+            "limits": {
+                "memory": plan_config['ram'],
+                "swap": 0,
+                "disk": plan_config['disk'],
+                "io": 500,
+                "cpu": plan_config['cpu']
+            }
+        }
+        response = requests.post(f"{PTERODACTYL_URL}/api/application/servers", headers=headers, json=server_data)
+        if response.status_code in [200, 201]:
+            return response.json()['attributes']['identifier']
+        return f"demo_{uuid.uuid4().hex[:8]}"
+    except:
+        return f"demo_{uuid.uuid4().hex[:8]}"
+
+
+# ===================== HOME PAGE =====================
+@app.get("/", response_class=HTMLResponse)
+async def home(session_token: Optional[str] = Cookie(None)):
+    user_id = verify_session(session_token)
+
+    return f"""
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ThemcHost.uz - Minecraft Hosting</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+
+        body {{
+            font-family: 'Inter', 'Segoe UI', sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+            overflow-x: hidden;
+        }}
+
+        /* Navigation */
+        nav {{
+            background: rgba(0, 0, 0, 0.95);
+            backdrop-filter: blur(10px);
+            padding: 15px 0;
+            border-bottom: 1px solid rgba(0, 255, 0, 0.2);
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }}
+
+        .nav-container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0 30px;
+        }}
+
+        .logo {{
+            font-size: 1.8em;
+            font-weight: 700;
+            color: #00ff00;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+
+        .nav-links {{
+            display: flex;
+            gap: 35px;
+            align-items: center;
+        }}
+
+        .nav-links a {{
+            color: #fff;
+            text-decoration: none;
+            font-weight: 500;
+            transition: all 0.3s;
+            font-size: 0.95em;
+        }}
+
+        .nav-links a:hover {{
+            color: #00ff00;
+        }}
+
+        .auth-buttons {{
+            display: flex;
+            gap: 15px;
+        }}
+
+        .btn {{
+            padding: 10px 25px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s;
+            border: none;
+            cursor: pointer;
+            font-size: 0.95em;
+        }}
+
+        .btn-login {{
+            background: transparent;
+            color: #00ff00;
+            border: 2px solid #00ff00;
+        }}
+
+        .btn-login:hover {{
+            background: rgba(0, 255, 0, 0.1);
+        }}
+
+        .btn-register {{
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            border: none;
+        }}
+
+        .btn-register:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 255, 0, 0.4);
+        }}
+
+        .btn-dashboard {{
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+        }}
+
+        /* Hero */
+        .hero {{
+            padding: 120px 30px;
+            text-align: center;
+            background: linear-gradient(135deg, rgba(0, 0, 0, 0.9), rgba(0, 255, 0, 0.05));
+            position: relative;
+            overflow: hidden;
+        }}
+
+        .hero::before {{
+            content: '';
+            position: absolute;
+            width: 500px;
+            height: 500px;
+            background: radial-gradient(circle, rgba(0, 255, 0, 0.1), transparent);
+            top: -250px;
+            right: -250px;
+            animation: pulse 4s infinite;
+        }}
+
+        @keyframes pulse {{
+            0%, 100% {{ transform: scale(1); opacity: 0.5; }}
+            50% {{ transform: scale(1.2); opacity: 0.8; }}
+        }}
+
+        .hero h1 {{
+            font-size: 4em;
+            margin-bottom: 20px;
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 800;
+        }}
+
+        .hero p {{
+            font-size: 1.3em;
+            color: #aaa;
+            margin-bottom: 40px;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }}
+
+        .hero-cta {{
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            padding: 18px 45px;
+            font-size: 1.2em;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 700;
+            transition: all 0.3s;
+            text-decoration: none;
+            display: inline-block;
+        }}
+
+        .hero-cta:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
+        }}
+
+        /* Stats */
+        .stats {{
+            background: #111;
+            padding: 60px 30px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 40px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+
+        .stat-item {{
+            text-align: center;
+        }}
+
+        .stat-number {{
+            font-size: 3em;
+            color: #00ff00;
+            font-weight: 700;
+        }}
+
+        .stat-label {{
+            color: #888;
+            font-size: 1.1em;
+            margin-top: 10px;
+        }}
+
+        /* Plans */
+        .plans {{
+            max-width: 1400px;
+            margin: 80px auto;
+            padding: 0 30px;
+        }}
+
+        .section-title {{
+            text-align: center;
+            font-size: 3em;
+            margin-bottom: 60px;
+            color: #00ff00;
+            font-weight: 700;
+        }}
+
+        .plans-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 25px;
+        }}
+
+        .plan-card {{
+            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
+            border: 1px solid rgba(0, 255, 0, 0.3);
+            border-radius: 20px;
+            padding: 40px 30px;
+            text-align: center;
+            transition: all 0.4s;
+            position: relative;
+            overflow: hidden;
+        }}
+
+        .plan-card::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(0, 255, 0, 0.1), transparent);
+            transition: 0.5s;
+        }}
+
+        .plan-card:hover::before {{
+            left: 100%;
+        }}
+
+        .plan-card:hover {{
+            transform: translateY(-10px);
+            border-color: #00ff00;
+            box-shadow: 0 15px 40px rgba(0, 255, 0, 0.3);
+        }}
+
+        .plan-badge {{
+            display: inline-block;
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 700;
+            margin-bottom: 15px;
+        }}
+
+        .plan-name {{
+            font-size: 1.8em;
+            color: #00ff00;
+            margin-bottom: 20px;
+            font-weight: 700;
+        }}
+
+        .plan-price {{
+            font-size: 2.5em;
+            color: #fff;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }}
+
+        .plan-period {{
+            color: #888;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }}
+
+        .plan-features {{
+            list-style: none;
+            margin-bottom: 30px;
+            text-align: left;
+        }}
+
+        .plan-features li {{
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            color: #ccc;
+            font-size: 1em;
+        }}
+
+        .plan-features li:last-child {{
+            border-bottom: none;
+        }}
+
+        .select-plan {{
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            padding: 14px 35px;
+            border: none;
+            border-radius: 30px;
+            cursor: pointer;
+            font-weight: 700;
+            transition: all 0.3s;
+            font-size: 1em;
+            width: 100%;
+        }}
+
+        .select-plan:hover {{
+            transform: scale(1.05);
+            box-shadow: 0 8px 25px rgba(0, 255, 0, 0.5);
+        }}
+
+        /* Features */
+        .features {{
+            background: #111;
+            padding: 80px 30px;
+        }}
+
+        .features-grid {{
+            max-width: 1400px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 30px;
+            margin-top: 60px;
+        }}
+
+        .feature-card {{
+            background: rgba(0, 255, 0, 0.05);
+            border: 1px solid rgba(0, 255, 0, 0.2);
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            transition: all 0.3s;
+        }}
+
+        .feature-card:hover {{
+            transform: translateY(-5px);
+            border-color: #00ff00;
+            background: rgba(0, 255, 0, 0.1);
+        }}
+
+        .feature-icon {{
+            font-size: 3.5em;
+            margin-bottom: 20px;
+        }}
+
+        .feature-title {{
+            color: #00ff00;
+            font-size: 1.5em;
+            margin-bottom: 15px;
+            font-weight: 700;
+        }}
+
+        .feature-desc {{
+            color: #aaa;
+            line-height: 1.6;
+        }}
+
+        /* Footer */
+        footer {{
+            background: #000;
+            padding: 50px 30px;
+            text-align: center;
+            border-top: 1px solid rgba(0, 255, 0, 0.2);
+        }}
+
+        .footer-content {{
+            max-width: 1400px;
+            margin: 0 auto;
+        }}
+
+        .footer-links {{
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }}
+
+        .footer-links a {{
+            color: #00ff00;
+            text-decoration: none;
+            transition: all 0.3s;
+            font-size: 1.1em;
+        }}
+
+        .footer-links a:hover {{
+            color: #00cc00;
+        }}
+
+        /* Responsive */
+        @media (max-width: 768px) {{
+            .hero h1 {{
+                font-size: 2.5em;
+            }}
+            .nav-links {{
+                display: none;
+            }}
+            .plans-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <nav>
+        <div class="nav-container">
+            <div class="logo">⛏️ ThemcHost.uz</div>
+            <div class="nav-links">
+                <a href="#plans">Tariflar</a>
+                <a href="#features">Imkoniyatlar</a>
+                <a href="#about">Biz haqimizda</a>
+            </div>
+            <div class="auth-buttons">
+                {'<a href="/dashboard" class="btn btn-dashboard">Dashboard</a>' if user_id else '<a href="/login" class="btn btn-login">Kirish</a><a href="/register" class="btn btn-register">Royxatdan otish</a>'}
+            </div>
+        </div>
+    </nav>
+
+    <section class="hero">
+        <h1>O'zbekistondagi #1 Minecraft Hosting</h1>
+        <p>Yuqori tezlik, ishonchlilik va professional texnik yordam bilan serveringizni bugun yarating</p>
+        <a href="{'#plans' if not user_id else '/dashboard'}" class="hero-cta">Serveringizni Yarating</a>
+    </section>
+
+    <section class="stats">
+        <div class="stat-item">
+            <div class="stat-number">1500+</div>
+            <div class="stat-label">Faol Serverlar</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-number">5000+</div>
+            <div class="stat-label">Mijozlar</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-number">99.9%</div>
+            <div class="stat-label">Uptime</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-number">24/7</div>
+            <div class="stat-label">Qo'llab-quvvatlash</div>
+        </div>
+    </section>
+
+    <section class="plans" id="plans">
+        <h2 class="section-title">Tariflar</h2>
+        <div class="plans-grid">
+            <div class="plan-card">
+                <div class="plan-name">🔷 PROXY</div>
+                <div class="plan-price">5.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 70% CPU</li>
+                    <li>⭐ 2GB RAM</li>
+                    <li>💾 5GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <div class="plan-name">🔷 RARE</div>
+                <div class="plan-price">20.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 100% CPU</li>
+                    <li>⭐ 4GB RAM</li>
+                    <li>💾 10GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <span class="plan-badge">🔥 RECOMMEND</span>
+                <div class="plan-name">🔷 PRO</div>
+                <div class="plan-price">45.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 200% CPU</li>
+                    <li>⭐ 8GB RAM</li>
+                    <li>💾 25GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>🎁 Plugin Install</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <div class="plan-name">🔷 BOOST</div>
+                <div class="plan-price">70.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 300% CPU</li>
+                    <li>⭐ 12GB RAM</li>
+                    <li>💾 40GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>🎁 Plugin Install</li>
+                    <li>🚀 DDoS Protection</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <div class="plan-name">🔷 BOOST+</div>
+                <div class="plan-price">120.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 300% CPU</li>
+                    <li>⭐ 16GB RAM</li>
+                    <li>💾 50GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>🎁 Plugin Install</li>
+                    <li>🚀 DDoS Protection</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <div class="plan-name">✨ FOREST</div>
+                <div class="plan-price">150.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 400% CPU</li>
+                    <li>⭐ 20GB RAM</li>
+                    <li>💾 70GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>🎁 Plugin Install</li>
+                    <li>🚀 DDoS Protection</li>
+                    <li>⭐ Premium Support</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <div class="plan-name">✨ FOREST+</div>
+                <div class="plan-price">195.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 500% CPU</li>
+                    <li>⭐ 24GB RAM</li>
+                    <li>💾 90GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>🎁 Plugin Install</li>
+                    <li>🚀 DDoS Protection</li>
+                    <li>⭐ Premium Support</li>
+                    <li>📞 24/7 Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+
+            <div class="plan-card">
+                <span class="plan-badge">👑 VIP</span>
+                <div class="plan-name">🔺 VULCAN</div>
+                <div class="plan-price">260.000</div>
+                <div class="plan-period">UZS/oyiga</div>
+                <ul class="plan-features">
+                    <li>⚡ 700% CPU</li>
+                    <li>⭐ 32GB RAM</li>
+                    <li>💾 110GB SSD</li>
+                    <li>🔄 Auto Backup</li>
+                    <li>🎁 Plugin Install</li>
+                    <li>🚀 DDoS Protection</li>
+                    <li>👑 VIP Support</li>
+                    <li>⭐ Premium Support</li>
+                </ul>
+                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
+            </div>
+        </div>
+    </section>
+
+    <section class="features" id="features">
+        <h2 class="section-title">Bizning Afzalliklarimiz</h2>
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">⚡</div>
+                <div class="feature-title">Yuqori Tezlik</div>
+                <div class="feature-desc">NVMe SSD va yuqori tezlikdagi tarmoq</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🛡️</div>
+                <div class="feature-title">DDoS Himoya</div>
+                <div class="feature-desc">Professional DDoS hujumlardan himoya</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🔄</div>
+                <div class="feature-title">Auto Backup</div>
+                <div class="feature-desc">Kundalik avtomatik zaxira nusxa</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">🎮</div>
+                <div class="feature-title">1-Click Install</div>
+                <div class="feature-desc">Mod va pluginlarni oson o'rnatish</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">📊</div>
+                <div class="feature-title">Monitoring</div>
+                <div class="feature-desc">Real-time server monitoring</div>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">💬</div>
+                <div class="feature-title">24/7 Support</div>
+                <div class="feature-desc">Telegram orqali doimiy yordam</div>
+            </div>
+        </div>
+    </section>
+
+    <footer id="about">
+            <div class="footer-links">
+                <a href="https://t.me/TheMC_Uz" target="_blank">Telegram</a>
+                <a href="https://instagram.com/themchost" target="_blank">Instagram</a>
+                <a href="https://discord.gg/ABCDE" target="_blank">Discord</a>
+                <a href="/terms.html">Umumiy shartlar</a>
+                </div>
+            </div>
+        </div>
+    </footer>
+</body>
+</html>
+    """
+
+
+# ===================== LOGIN PAGE =====================
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return """
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kirish - ThemcHost.uz</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: absolute;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, rgba(0, 255, 0, 0.1), transparent);
+            top: -300px;
+            left: -300px;
+            animation: pulse 4s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+        }
+
+        .login-container {
+            background: rgba(26, 26, 26, 0.95);
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(0, 255, 0, 0.3);
+            border-radius: 20px;
+            padding: 50px 40px;
+            width: 100%;
+            max-width: 450px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            position: relative;
+            z-index: 10;
+        }
+
+        .logo {
+            text-align: center;
+            font-size: 2.5em;
+            color: #00ff00;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 40px;
+            font-size: 1.1em;
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        .form-group label {
+            display: block;
+            color: #00ff00;
+            margin-bottom: 10px;
+            font-weight: 600;
+            font-size: 0.95em;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 2px solid rgba(0, 255, 0, 0.3);
+            border-radius: 10px;
+            color: #fff;
+            font-size: 1em;
+            transition: all 0.3s;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #00ff00;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+        }
+
+        .btn-login {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 10px;
+        }
+
+        .btn-login:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
+        }
+
+        .divider {
+            text-align: center;
+            color: #666;
+            margin: 30px 0;
+            position: relative;
+        }
+
+        .divider::before,
+        .divider::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            width: 40%;
+            height: 1px;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .divider::before {
+            left: 0;
+        }
+
+        .divider::after {
+            right: 0;
+        }
+
+        .register-link {
+            text-align: center;
+            color: #888;
+            margin-top: 20px;
+        }
+
+        .register-link a {
+            color: #00ff00;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        .register-link a:hover {
+            color: #00cc00;
+        }
+
+        .back-home {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .back-home a {
+            color: #666;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+
+        .back-home a:hover {
+            color: #00ff00;
+        }
+
+        .error-message {
+            background: rgba(255, 0, 0, 0.1);
+            border: 1px solid rgba(255, 0, 0, 0.3);
+            color: #ff4444;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">⛏️ ThemcHost.uz</div>
+        <div class="subtitle">Hisobingizga kiring</div>
+
+        <div id="errorMessage" class="error-message"></div>
+
+        <form id="loginForm">
+            <div class="form-group">
+                <label>Email yoki Username</label>
+                <input type="text" name="username" required placeholder="username@example.com">
+            </div>
+
+            <div class="form-group">
+                <label>Parol</label>
+                <input type="password" name="password" required placeholder="••••••••">
+            </div>
+
+            <button type="submit" class="btn-login">Kirish</button>
+        </form>
+
+        <div class="divider">yoki</div>
+
+        <div class="register-link">
+            Hisobingiz yo'qmi? <a href="/register">Ro'yxatdan o'ting</a>
+        </div>
+
+        <div class="back-home">
+            <a href="/">← Bosh sahifaga qaytish</a>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams(formData)
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    window.location.href = '/dashboard';
+                } else {
+                    document.getElementById('errorMessage').style.display = 'block';
+                    document.getElementById('errorMessage').textContent = result.message;
+                }
+            } catch (error) {
+                document.getElementById('errorMessage').style.display = 'block';
+                document.getElementById('errorMessage').textContent = 'Xatolik yuz berdi!';
+            }
+        });
+    </script>
+</body>
+</html>
+    """
+
+
+# ===================== REGISTER PAGE =====================
+@app.get("/register", response_class=HTMLResponse)
+async def register_page():
+    return """
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ro'yxatdan o'tish - ThemcHost.uz</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+            overflow: hidden;
+            padding: 20px;
+        }
+
+        body::before {
+            content: '';
+            position: absolute;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, rgba(0, 255, 0, 0.1), transparent);
+            bottom: -300px;
+            right: -300px;
+            animation: pulse 4s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.2); }
+        }
+
+        .register-container {
+            background: rgba(26, 26, 26, 0.95);
+            backdrop-filter: blur(10px);
+            border: 2px solid rgba(0, 255, 0, 0.3);
+            border-radius: 20px;
+            padding: 50px 40px;
+            width: 100%;
+            max-width: 450px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            position: relative;
+            z-index: 10;
+        }
+
+        .logo {
+            text-align: center;
+            font-size: 2.5em;
+            color: #00ff00;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #888;
+            margin-bottom: 40px;
+            font-size: 1.1em;
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        .form-group label {
+            display: block;
+            color: #00ff00;
+            margin-bottom: 10px;
+            font-weight: 600;
+            font-size: 0.95em;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 2px solid rgba(0, 255, 0, 0.3);
+            border-radius: 10px;
+            color: #fff;
+            font-size: 1em;
+            transition: all 0.3s;
+        }
+
+        .form-group input:focus {
+            outline: none;
+            border-color: #00ff00;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
+        }
+
+        .btn-register {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1em;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 10px;
+        }
+
+        .btn-register:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
+        }
+
+        .divider {
+            text-align: center;
+            color: #666;
+            margin: 30px 0;
+            position: relative;
+        }
+
+        .divider::before,
+        .divider::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            width: 40%;
+            height: 1px;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .divider::before {
+            left: 0;
+        }
+
+        .divider::after {
+            right: 0;
+        }
+
+        .login-link {
+            text-align: center;
+            color: #888;
+            margin-top: 20px;
+        }
+
+        .login-link a {
+            color: #00ff00;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        .login-link a:hover {
+            color: #00cc00;
+        }
+
+        .back-home {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .back-home a {
+            color: #666;
+            text-decoration: none;
+            transition: all 0.3s;
+        }
+
+        .back-home a:hover {
+            color: #00ff00;
+        }
+
+        .error-message, .success-message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .error-message {
+            background: rgba(255, 0, 0, 0.1);
+            border: 1px solid rgba(255, 0, 0, 0.3);
+            color: #ff4444;
+        }
+
+        .success-message {
+            background: rgba(0, 255, 0, 0.1);
+            border: 1px solid rgba(0, 255, 0, 0.3);
+            color: #00ff00;
+        }
+    </style>
+</head>
+<body>
+    <div class="register-container">
+        <div class="logo">⛏️ ThemcHost.uz</div>
+        <div class="subtitle">Yangi hisob yarating</div>
+
+        <div id="errorMessage" class="error-message"></div>
+        <div id="successMessage" class="success-message"></div>
+
+        <form id="registerForm">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required placeholder="username" minlength="3">
+            </div>
+
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" required placeholder="email@example.com">
+            </div>
+
+            <div class="form-group">
+                <label>Parol</label>
+                <input type="password" name="password" required placeholder="••••••••" minlength="6">
+            </div>
+
+            <div class="form-group">
+                <label>Parolni tasdiqlang</label>
+                <input type="password" name="confirm_password" required placeholder="••••••••" minlength="6">
+            </div>
+
+            <button type="submit" class="btn-register">Ro'yxatdan o'tish</button>
+        </form>
+
+        <div class="divider">yoki</div>
+
+        <div class="login-link">
+            Hisobingiz bormi? <a href="/login">Kirish</a>
+        </div>
+
+        <div class="back-home">
+            <a href="/">← Bosh sahifaga qaytish</a>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('registerForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+
+            if (formData.get('password') !== formData.get('confirm_password')) {
+                document.getElementById('errorMessage').style.display = 'block';
+                document.getElementById('errorMessage').textContent = 'Parollar mos kelmadi!';
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams(formData)
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    document.getElementById('successMessage').style.display = 'block';
+                    document.getElementById('successMessage').textContent = 'Muvaffaqiyatli! Kirish sahifasiga yo\\'naltirilmoqda...';
+                    setTimeout(() => {
+                        window.location.href = '/login';
+                    }, 2000);
+                } else {
+                    document.getElementById('errorMessage').style.display = 'block';
+                    document.getElementById('errorMessage').textContent = result.message;
+                }
+            } catch (error) {
+                document.getElementById('errorMessage').style.display = 'block';
+                document.getElementById('errorMessage').textContent = 'Xatolik yuz berdi!';
+            }
+        });
+    </script>
+</body>
+</html>
+    """
+
+
+# ===================== API: LOGIN =====================
+@app.post("/api/login")
+async def api_login(username: str = Form(...), password: str = Form(...)):
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+
+    hashed_pw = hash_password(password)
+    c.execute('SELECT * FROM users WHERE (username = ? OR email = ?) AND password = ?',
+              (username, username, hashed_pw))
+    user = c.fetchone()
+
+    if not user:
+        conn.close()
+        return JSONResponse({"success": False, "message": "Username yoki parol noto'g'ri!"})
+
+    session_token = secrets.token_urlsafe(32)
+    c.execute('INSERT INTO sessions (user_id, session_token, created_at) VALUES (?, ?, ?)',
+              (user[0], session_token, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+    response = JSONResponse({"success": True, "message": "Muvaffaqiyatli!"})
+    response.set_cookie(key="session_token", value=session_token, httponly=True, max_age=86400 * 30)
+    return response
+
+
+## ===================== API: REGISTER =====================
+@app.post("/api/register")
+async def api_register(
+        username: str = Form(...),
+        email: str = Form(...),
+        password: str = Form(...),
+        confirm_password: str = Form(...)
+):
+    # Parollarni tekshirish
+    if password != confirm_password:
+        return JSONResponse({"success": False, "message": "Parollar mos kelmadi!"})
+
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+    try:
+        # Bandligini tekshirish
+        c.execute('SELECT id FROM users WHERE username = ? OR email = ?', (username, email))
+        if c.fetchone():
+            return JSONResponse({"success": False, "message": "Username yoki Email band!"})
+
+        hashed_pw = hash_password(password)
+        created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # Ma'lumotni bazaga yozish
+        c.execute('''INSERT INTO users (username, email, password, balance, created_at)
+                     VALUES (?, ?, ?, ?, ?)''', (username, email, hashed_pw, 0.0, created_at))
+        conn.commit()
+        return JSONResponse({"success": True, "message": "Ro'yxatdan o'tdingiz!"})
+    except Exception as e:
+        return JSONResponse({"success": False, "message": f"Xatolik: {str(e)}"})
+    finally:
+        conn.close()
+
+# ===================== DASHBOARD =====================
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(session_token: Optional[str] = Cookie(None)):
+    user_id = verify_session(session_token)
+    if not user_id:
+        return RedirectResponse(url="/login")
+
+    user = get_user_by_id(user_id)
+    if not user:
+        return RedirectResponse(url="/login")
+
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM servers WHERE user_id = ?', (user_id,))
+    servers = c.fetchall()
+    c.execute('SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', (user_id,))
+    transactions = c.fetchall()
+    conn.close()
+
+    servers_html = ""
+    for srv in servers:
+        servers_html += f"""
+        <div class="server-card">
+            <div class="server-header">
+                <div class="server-icon">⛏️</div>
+                <div class="server-info">
+                    <div class="server-name">{srv[2]}</div>
+                    <div class="server-domain">{srv[3]}</div>
+                </div>
+                <div class="server-status {'active' if srv[9] == 'active' else 'inactive'}">{srv[9].upper()}</div>
+            </div>
+            <div class="server-specs">
+                <div class="spec-item">
+                    <div class="spec-label">RAM</div>
+                    <div class="spec-value">{srv[5]}MB</div>
+                </div>
+                <div class="spec-item">
+                    <div class="spec-label">CPU</div>
+                    <div class="spec-value">{srv[6]}%</div>
+                </div>
+                <div class="spec-item">
+                    <div class="spec-label">DISK</div>
+                    <div class="spec-value">{srv[7]}MB</div>
+                </div>
+                <div class="spec-item">
+                    <div class="spec-label">PLAN</div>
+                    <div class="spec-value">{srv[4].upper()}</div>
+                </div>
+            </div>
+            <div class="server-actions">
+                <button class="btn-action" onclick="window.open('{PTERODACTYL_URL}/server/{srv[8]}', '_blank')">
+                    🎮 Panel
+                </button>
+                <button class="btn-action danger" onclick="deleteServer('{srv[8]}')">
+                    🗑️ O'chirish
+                </button>
+            </div>
+        </div>
+        """
+
+    if not servers_html:
+        servers_html = """
+        <div style="text-align: center; padding: 60px 20px; color: #666;">
+            <div style="font-size: 4em; margin-bottom: 20px;">📦</div>
+            <h3 style="color: #888; margin-bottom: 10px;">Serverlar yo'q</h3>
+            <p>Birinchi serveringizni yarating!</p>
+        </div>
+        """
+
+    transactions_html = ""
+    for tx in transactions:
+        tx_type = "+" if tx[3] == "deposit" else "-"
+        tx_color = "#00ff00" if tx[3] == "deposit" else "#ff4444"
+        transactions_html += f"""
+        <tr>
+            <td>{tx[5]}</td>
+            <td>{tx[4]}</td>
+            <td style="color: {tx_color}; font-weight: 600;">{tx_type}{tx[2]:,.0f} UZS</td>
+            <td><span class="badge">{tx[3]}</span></td>
+        </tr>
+        """
+
+    if not transactions_html:
+        transactions_html = """
+        <tr>
+            <td colspan="4" style="text-align: center; color: #666; padding: 30px;">
+                Tranzaksiyalar yo'q
+            </td>
+        </tr>
+        """
+
+    return f"""
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - ThemcHost.uz</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+
+        body {{
+            font-family: 'Inter', sans-serif;
+            background: #0a0a0a;
+            color: #fff;
+        }}
+
+        /* Sidebar */
+        .sidebar {{
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 280px;
+            height: 100vh;
+            background: #111;
+            border-right: 1px solid rgba(0, 255, 0, 0.2);
+            padding: 30px 20px;
+            overflow-y: auto;
+        }}
+
+        .logo {{
+            font-size: 1.8em;
+            color: #00ff00;
+            margin-bottom: 50px;
+            font-weight: 700;
+            text-align: center;
+        }}
+
+        .menu-item {{
+            padding: 15px 20px;
+            margin-bottom: 10px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: #888;
+            text-decoration: none;
+        }}
+
+        .menu-item:hover, .menu-item.active {{
+            background: rgba(0, 255, 0, 0.1);
+            color: #00ff00;
+        }}
+
+        .menu-icon {{
+            font-size: 1.3em;
+        }}
+
+        .user-info {{
+            margin-top: auto;
+            padding-top: 30px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+
+        .user-name {{
+            color: #00ff00;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }}
+
+        .user-balance {{
+            color: #888;
+            font-size: 0.9em;
+        }}
+
+        .btn-logout {{
+            width: 100%;
+            padding: 12px;
+            background: rgba(255, 0, 0, 0.1);
+            border: 1px solid rgba(255, 0, 0, 0.3);
+            color: #ff4444;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-top: 15px;
+            font-weight: 600;
+            transition: all 0.3s;
+        }}
+
+        .btn-logout:hover {{
+            background: rgba(255, 0, 0, 0.2);
+        }}
+
+        /* Main Content */
+        .main-content {{
+            margin-left: 280px;
+            padding: 30px;
+        }}
+
+        .header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 40px;
+        }}
+
+        .page-title {{
+            font-size: 2.5em;
+            color: #00ff00;
+            font-weight: 700;
+        }}
+
+        /* Stats Cards */
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 25px;
+            margin-bottom: 40px;
+        }}
+
+        .stat-card {{
+            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
+            border: 1px solid rgba(0, 255, 0, 0.3);
+            border-radius: 15px;
+            padding: 25px;
+            transition: all 0.3s;
+        }}
+
+        .stat-card:hover {{
+            transform: translateY(-5px);
+            border-color: #00ff00;
+            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.2);
+        }}
+
+        .stat-icon {{
+            font-size: 2.5em;
+            margin-bottom: 15px;
+        }}
+
+        .stat-label {{
+            color: #888;
+            font-size: 0.95em;
+            margin-bottom: 8px;
+        }}
+
+        .stat-value {{
+            font-size: 2em;
+            color: #00ff00;
+            font-weight: 700;
+        }}
+
+        /* Section */
+        .section {{
+            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
+            border: 1px solid rgba(0, 255, 0, 0.3);
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 30px;
+        }}
+
+        .section-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+        }}
+
+        .section-title {{
+            font-size: 1.8em;
+            color: #00ff00;
+            font-weight: 700;
+        }}
+
+        .btn-primary {{
+            background: linear-gradient(135deg, #00ff00, #00cc00);
+            color: #000;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 10px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+        }}
+
+        .btn-primary:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0, 255, 0, 0.5);
+        }}
+
+        /* Servers */
+        .servers-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 25px;
+        }}
+
+        .server-card {{
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(0, 255, 0, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s;
+        }}
+
+        .server-card:hover {{
+            border-color: #00ff00;
+            box-shadow: 0 8px 25px rgba(0, 255, 0, 0.2);
+        }}
+
+        .server-header {{
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+
+        .server-icon {{
+            font-size: 2.5em;
+        }}
+
+        .server-info {{
+            flex: 1;
+        }}
+
+        .server-name {{
+            font-size: 1.3em;
+            color: #00ff00;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }}
+
+        .server-domain {{
+            color: #888;
+            font-size: 0.9em;
+        }}
+
+        .server-status {{
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 700;
+        }}
+
+        .server-status.active {{
+            background: rgba(0, 255, 0, 0.2);
+            color: #00ff00;
+        }}
+
+        .server-status.inactive {{
+            background: rgba(255, 0, 0, 0.2);
+            color: #ff4444;
+        }}
+
+        .server-specs {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }}
+
+        .spec-item {{
+            background: rgba(0, 0, 0, 0.3);
+            padding: 12px;
+            border-radius: 8px;
+            text-align: center;
+        }}
+
+        .spec-label {{
+            color: #666;
+            font-size: 0.85em;
+            margin-bottom: 5px;
+        }}
+
+        .spec-value {{
+            color: #00ff00;
+            font-size: 1.2em;
+            font-weight: 700;
+        }}
+
+        .server-actions {{
+            display: flex;
+            gap: 10px;
+        }}
+
+        .btn-action {{
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            background: rgba(0, 255, 0, 0.1);
+            color: #00ff00;
+            border: 1px solid rgba(0, 255, 0, 0.3);
+        }}
+
+        .btn-action:hover {{
+            background: rgba(0, 255, 0, 0.2);
+            transform: translateY(-2px);
+        }}
+
+        .btn-action.danger {{
+            background: rgba(255, 0, 0, 0.1);
+            color: #ff4444;
+            border-color: rgba(255, 0, 0, 0.3);
+        }}
+
+        .btn-action.danger:hover {{
+            background: rgba(255, 0, 0, 0.2);
+        }}
+
+        /* Table */
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+
+        th, td {{
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }}
+
+        th {{
+            color: #00ff00;
+            font-weight: 700;
+            background: rgba(0, 0, 0, 0.3);
+        }}
+
+        td {{
+            color: #ccc;
+        }}
+
+        .badge {{
+            padding: 4px 10px;
+            border-radius: 15px;
+            background: rgba(0, 255, 0, 0.2);
+            color: #00ff00;
+            font-size: 0.85em;
+            font-weight: 600;
+        }}
+
+        /* Modal */
+        .modal {{
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            overflow-y: auto;
+        }}
+
+        .modal-content {{
+            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
+            margin: 50px auto;
+            padding: 40px;
+            border: 2px solid #00ff00;
+            border-radius: 15px;
+            width: 90%;
+            max-width: 600px;
+            box-shadow: 0 10px 50px rgba(0, 255, 0, 0.3);
+        }}
+
+        .close {{
+            color: #00ff00;
+            float: right;
+            font-size: 35px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s;
+        }}
+
+        .close:hover {{
+            color: #00cc00;
+            transform: rotate(90deg);
+        }}
+
+        .form-group {{
+            margin-bottom: 25px;
+        }}
+
+        .form-group label {{
+            display: block;
+            color: #00ff00;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }}
+
+        .form-group input,
+        .form-group select {{
+            width: 100%;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 2px solid rgba(0, 255, 0, 0.3);
+            border-radius: 8px;
+            color: #fff;
+            font-size: 1em;
+            transition: all 0.3s;
+        }}
+
+        .form-group input:focus,
+        .form-group select:focus {{
+            outline: none;
+            border-color: #00ff00;
+            box-shadow: 0 0 15px rgba(0, 255, 0, 0.3);
+        }}
+
+        /* Responsive */
+        @media (max-width: 768px) {{
+            .sidebar {{
+                width: 100%;
+                height: auto;
+                position: relative;
+            }}
+            .main-content {{
+                margin-left: 0;
+            }}
+            .servers-grid {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo">⛏️ ThemcHost.uz</div>
+
+        <div class="menu-item active">
+            <span class="menu-icon">🏠</span>
+            <span>Dashboard</span>
+        </div>
+        <div class="menu-item" onclick="document.getElementById('createModal').style.display='block'">
+            <span class="menu-icon">➕</span>
+            <span>Server Yaratish</span>
+        </div>
+        <div class="menu-item">
+            <span class="menu-icon">💰</span>
+            <span>Balansni To'ldirish</span>
+        </div>
+        <div class="menu-item">
+            <span class="menu-icon">📊</span>
+            <span>Tranzaksiyalar</span>
+        </div>
+        <div class="menu-item">
+            <span class="menu-icon">⚙️</span>
+            <span>Sozlamalar</span>
+        </div>
+
+        <div class="user-info">
+            <div class="user-name">👤 {user[1]}</div>
+            <div class="user-balance">💵 Balans: {user[4]:,.0f} UZS</div>
+            <button class="btn-logout" onclick="logout()">🚪 Chiqish</button>
+        </div>
+    </div>
+
+    <div class="main-content">
+        <div class="header">
+            <h1 class="page-title">Dashboard</h1>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">🖥️</div>
+                <div class="stat-label">Serverlar</div>
+                <div class="stat-value">{len(servers)}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">💰</div>
+                <div class="stat-label">Balans</div>
+                <div class="stat-value">{user[4]:,.0f}</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">📊</div>
+                <div class="stat-label">Umumiy Xarajat</div>
+                <div class="stat-value">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">⚡</div>
+                <div class="stat-label">Faol Serverlar</div>
+                <div class="stat-value">{sum(1 for s in servers if s[9] == 'active')}</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">Mening Serverlarim</h2>
+                <button class="btn-primary" onclick="document.getElementById('createModal').style.display='block'">
+                    ➕ Yangi Server
+                </button>
+            </div>
+            <div class="servers-grid">
+                {servers_html}
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">So'nggi Tranzaksiyalar</h2>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Sana</th>
+                        <th>Tavsif</th>
+                        <th>Summa</th>
+                        <th>Turi</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {transactions_html}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Create Server Modal -->
+    <div id="createModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="document.getElementById('createModal').style.display='none'">&times;</span>
+            <h2 style="color: #00ff00; margin-bottom: 30px;">Yangi Server Yaratish</h2>
+            <form id="createForm">
+                <div class="form-group">
+                    <label>Server Nomi</label>
+                    <input type="text" name="server_name" required placeholder="MyAwesomeServer">
+                </div>
+                <div class="form-group">
+                    <label>Subdomain</label>
+                    <input type="text" name="domain" required placeholder="myserver" pattern="[a-z0-9-]+" title="Faqat kichik harflar, raqamlar va - belgisi">
+                    <small style="color: #666;">*.themchost.uz</small>
+                </div>
+                <div class="form-group">
+                    <label>Tarif</label>
+                    <select name="plan" required id="planSelect" onchange="updatePrice()">
+                        <option value="proxy">🔷 PROXY - 5,000 UZS/oy (2GB RAM, 70% CPU)</option>
+                        <option value="rare">🔷 RARE - 20,000 UZS/oy (4GB RAM, 100% CPU)</option>
+                        <option value="pro">🔷 PRO - 45,000 UZS/oy (8GB RAM, 200% CPU)</option>
+                        <option value="boost">🔷 BOOST - 70,000 UZS/oy (12GB RAM, 300% CPU)</option>
+                        <option value="boost_plus">🔷 BOOST+ - 120,000 UZS/oy (16GB RAM, 300% CPU)</option>
+                        <option value="forest">✨ FOREST - 150,000 UZS/oy (20GB RAM, 400% CPU)</option>
+                        <option value="forest_plus">✨ FOREST+ - 195,000 UZS/oy (24GB RAM, 500% CPU)</option>
+                        <option value="vulcan">🔺 VULCAN - 260,000 UZS/oy (32GB RAM, 700% CPU)</option>
+                    </select>
+                </div>
+                <div style="background: rgba(0, 255, 0, 0.1); padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid rgba(0, 255, 0, 0.3);">
+                    <div style="color: #00ff00; font-weight: 600;">Sizning balansingiz: {user[4]:,.0f} UZS</div>
+                    <div style="color: #888; margin-top: 5px;" id="priceInfo">Narx: 5,000 UZS/oy</div>
+                </div>
+                <button type="submit" class="btn-primary" style="width: 100%; padding: 15px; font-size: 1.1em;">
+                    🚀 Server Yaratish
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const plans = {{
+            proxy: 5000,
+            rare: 20000,
+            pro: 45000,
+            boost: 70000,
+            boost_plus: 120000,
+            forest: 150000,
+            forest_plus: 195000,
+            vulcan: 260000
+        }};
+
+        function updatePrice() {{
+            const plan = document.getElementById('planSelect').value;
+            const price = plans[plan];
+            document.getElementById('priceInfo').textContent = `Narx: ${{price.toLocaleString()}} UZS/oy`;
+        }}
+
+        document.getElementById('createForm').addEventListener('submit', async (e) => {{
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const plan = formData.get('plan');
+            const balance = {user[4]};
+
+            if (balance < plans[plan]) {{
+                alert('❌ Balans yetarli emas! Iltimos, balansni to\\'ldiring.');
+                return;
+            }}
+
+            try {{
+                const response = await fetch('/api/create-server', {{
+                    method: 'POST',
+                    body: formData
+                }});
+
+                const result = await response.json();
+
+                if (result.success) {{
+                    alert('✅ Server muvaffaqiyatli yaratildi!\\n\\nPanel: ' + result.panel_url);
+                    location.reload();
+                }} else {{
+                    alert('❌ Xatolik: ' + result.message);
+                }}
+            }} catch (error) {{
+                alert('❌ Server yaratishda xatolik!');
+            }}
+        }});
+
+        async function deleteServer(serverId) {{
+            if (!confirm('Serverni o\\'chirishni xohlaysizmi?')) return;
+
+            try {{
+                const response = await fetch(`/api/server/${{serverId}}`, {{
+                    method: 'DELETE'
+                }});
+
+                const result = await response.json();
+
+                if (result.success) {{
+                    alert('✅ Server o\\'chirildi!');
+                    location.reload();
+                }} else {{
+                    alert('❌ Xatolik: ' + result.message);
+                }}
+            }} catch (error) {{
+                alert('❌ Server o\\'chirishda xatolik!');
+            }}
+        }}
+
+        async function logout() {{
+            if (confirm('Chiqishni xohlaysizmi?')) {{
+                await fetch('/api/logout', {{ method: 'POST' }});
+                window.location.href = '/';
+            }}
+        }}
+
+        window.onclick = function(event) {{
+            const modal = document.getElementById('createModal');
+            if (event.target == modal) {{
+                modal.style.display = 'none';
+            }}
+        }}
+    </script>
+</body>
+</html>
+    """
+
+
+# ===================== API: CREATE SERVER =====================
+@app.post("/api/create-server")
+async def api_create_server(
+        session_token: Optional[str] = Cookie(None),
+        server_name: str = Form(...),
+        domain: str = Form(...),
+        plan: str = Form(...)
+):
+    user_id = verify_session(session_token)
+    if not user_id:
+        return JSONResponse({"success": False, "message": "Tizimga kiring!"})
+
+    user = get_user_by_id(user_id)
+    plan_info = PLANS.get(plan)
+
+    if not plan_info:
+        return JSONResponse({"success": False, "message": "Tarif topilmadi!"})
+
+    if user[4] < plan_info['price']:
+        return JSONResponse({"success": False, "message": "Balans yetarli emas!"})
+
+    pterodactyl_id = create_pterodactyl_server(server_name, plan, user[2])
+
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+
+    c.execute('''INSERT INTO servers
+                 (user_id, server_name, domain, plan, ram, cpu, disk, pterodactyl_id, status, created_at, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (user_id, server_name, f"{domain}.themchost.uz", plan,
+               plan_info['ram'], plan_info['cpu'], plan_info['disk'],
+               pterodactyl_id, 'active',
+               datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+               (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')))
+
+    new_balance = user[4] - plan_info['price']
+    c.execute('UPDATE users SET balance = ? WHERE id = ?', (new_balance, user_id))
+
+    c.execute('''INSERT INTO transactions
+                     (user_id, amount, type, description, created_at)
+                 VALUES (?, ?, ?, ?, ?)''',
+              (user_id, plan_info['price'], 'purchase',
+               f"Server yaratish: {server_name}",
+               datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+    conn.commit()
+    conn.close()
+
+    return JSONResponse({
+        "success": True,
+        "message": "Server yaratildi!",
+        "server_id": pterodactyl_id,
+        "panel_url": f"{PTERODACTYL_URL}/server/{pterodactyl_id}"
+    })
+
+
+# ===================== API: DELETE SERVER =====================
+@app.delete("/api/server/{server_id}")
+async def api_delete_server(server_id: str, session_token: Optional[str] = Cookie(None)):
+    user_id = verify_session(session_token)
+    if not user_id:
+        return JSONResponse({"success": False, "message": "Tizimga kiring!"})
+
+    conn = sqlite3.connect('hosting.db')
+    c = conn.cursor()
+    c.execute('SELECT * FROM servers WHERE pterodactyl_id = ? AND user_id = ?', (server_id, user_id))
+    server = c.fetchone()
+
+    if not server:
+        conn.close()
+        return JSONResponse({"success": False, "message": "Server topilmadi!"})
+
+    c.execute('DELETE FROM servers WHERE pterodactyl_id = ?', (server_id,))
+    conn.commit()
+    conn.close()
+
+    return JSONResponse({"success": True, "message": "Server o'chirildi!"})
+
+
+# ===================== API: LOGOUT =====================
+@app.post("/api/logout")
+async def api_logout(session_token: Optional[str] = Cookie(None)):
+    if session_token:
+        conn = sqlite3.connect('hosting.db')
+        c = conn.cursor()
+        c.execute('DELETE FROM sessions WHERE session_token = ?', (session_token,))
+        conn.commit()
+        conn.close()
+
+    response = JSONResponse({"success": True})
+    response.delete_cookie("session_token")
+    return response
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    print("🎮 ThemcHost.uz ishga tushmoqda...")
+    print("🌐 Sayt: http://127.0.0.1:8000")
+    print("🔐 Login: /login")
+    print("📝 Register: /register")
+    print("📊 Dashboard: /dashboard")
+    print("⭐ Ishga tushirish: uvicorn main:app --reload")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
