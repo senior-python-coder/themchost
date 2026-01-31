@@ -1,21 +1,56 @@
-from fastapi import FastAPI, HTTPException, Form, Request, Depends, Cookie
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
-from typing import Optional
+from flask import Flask, request, jsonify, redirect, url_for, session, send_from_directory
 import sqlite3
-import hashlib
-import uuid
-import requests
-import json
-from datetime import datetime, timedelta
 import secrets
+import hashlib
+import datetime
+import os
+from functools import wraps
+from werkzeug.utils import secure_filename
+from mcrcon import MCRcon
 
-app = FastAPI(title="ThemcHost.uz")
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif'}
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+from flask_socketio import SocketIO, emit
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+messages = []
+
+@socketio.on("send_message")
+def handle_message(data):
+    messages.append(data)
+    emit("receive_message", data, broadcast=True)
 
 
-# ===================== DATABASE =====================
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+
+def give_rank_to_player(minecraft_nick, rank_name):
+    try:
+        conn = sqlite3.connect('elitemc.db')
+        c = conn.cursor()
+        settings = {row[1]: row[2] for row in c.execute('SELECT * FROM settings').fetchall()}
+        conn.close()
+        rcon_host = settings.get('rcon_host', 'localhost')
+        rcon_port = int(settings.get('rcon_port', '25575'))
+        rcon_password = settings.get('rcon_password', 'your_password')
+        with MCRcon(rcon_host, rcon_password, port=rcon_port) as mcr:
+            command = f"lp user {minecraft_nick} parent set {rank_name}"
+            response = mcr.command(command)
+            return True, response
+    except Exception as e:
+        return False, str(e)
+
+
 def init_db():
-    conn = sqlite3.connect('hosting.db')
+    conn = sqlite3.connect('elitemc.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (
@@ -26,2238 +61,1623 @@ def init_db():
                      AUTOINCREMENT,
                      username
                      TEXT
-                     UNIQUE,
+                     UNIQUE
+                     NOT
+                     NULL,
                      email
                      TEXT
-                     UNIQUE,
+                     UNIQUE
+                     NOT
+                     NULL,
                      password
+                     TEXT
+                     NOT
+                     NULL,
+                     minecraft_nick
                      TEXT,
                      balance
                      REAL
                      DEFAULT
                      0,
-                     created_at
-                     TEXT
-                 )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS servers
-                 (
-                     id
-                     INTEGER
-                     PRIMARY
-                     KEY
-                     AUTOINCREMENT,
-                     user_id
-                     INTEGER,
-                     server_name
-                     TEXT,
-                     domain
-                     TEXT,
-                     plan
-                     TEXT,
-                     ram
-                     INTEGER,
-                     cpu
-                     INTEGER,
-                     disk
-                     INTEGER,
-                     pterodactyl_id
-                     TEXT,
-                     status
-                     TEXT
+                     is_admin
+                     BOOLEAN
                      DEFAULT
-                     'active',
+                     0,
                      created_at
-                     TEXT,
-                     expires_at
-                     TEXT
+                     TIMESTAMP
+                     DEFAULT
+                     CURRENT_TIMESTAMP
                  )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions
+    c.execute('''CREATE TABLE IF NOT EXISTS balance_deposits
+    (
+        id
+        INTEGER
+        PRIMARY
+        KEY
+        AUTOINCREMENT,
+        user_id
+        INTEGER,
+        amount
+        REAL
+        NOT
+        NULL,
+        card_number
+        TEXT
+        NOT
+        NULL,
+        transaction_id
+        TEXT
+        NOT
+        NULL,
+        screenshot
+        TEXT,
+        status
+        TEXT
+        DEFAULT
+        'pending',
+        admin_comment
+        TEXT,
+        created_at
+        TIMESTAMP
+        DEFAULT
+        CURRENT_TIMESTAMP,
+        processed_at
+        TIMESTAMP,
+        processed_by
+        INTEGER,
+        FOREIGN
+        KEY
+                 (
+        user_id
+                 ) REFERENCES users
+                 (
+                     id
+                 ), FOREIGN KEY
+                 (
+                     processed_by
+                 ) REFERENCES users
+                 (
+                     id
+                 ))''')
+    # init_db funksiyasi ichiga qo'shing:
+
+    c.execute('''CREATE TABLE IF NOT EXISTS support_tickets
+    (
+        id
+        INTEGER
+        PRIMARY
+        KEY
+        AUTOINCREMENT,
+        user_id
+        INTEGER,
+        subject
+        TEXT
+        NOT
+        NULL,
+        status
+        TEXT
+        DEFAULT
+        'open', -- open, answered, closed
+        created_at
+        TIMESTAMP
+        DEFAULT
+        CURRENT_TIMESTAMP,
+        FOREIGN
+        KEY
+                 (
+        user_id
+                 ) REFERENCES users
+                 (
+                     id
+                 )
+        )''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS support_messages
+    (
+        id
+        INTEGER
+        PRIMARY
+        KEY
+        AUTOINCREMENT,
+        ticket_id
+        INTEGER,
+        user_id
+        INTEGER,
+        message
+        TEXT
+        NOT
+        NULL,
+        is_admin_reply
+        BOOLEAN
+        DEFAULT
+        0,
+        created_at
+        TIMESTAMP
+        DEFAULT
+        CURRENT_TIMESTAMP,
+        FOREIGN
+        KEY
+                 (
+        ticket_id
+                 ) REFERENCES support_tickets
+                 (
+                     id
+                 ),
+        FOREIGN KEY
+                 (
+                     user_id
+                 ) REFERENCES users
+                 (
+                     id
+                 )
+        )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS purchases
+    (
+        id
+        INTEGER
+        PRIMARY
+        KEY
+        AUTOINCREMENT,
+        user_id
+        INTEGER,
+        package_id
+        INTEGER,
+        amount
+        REAL
+        NOT
+        NULL,
+        package_name
+        TEXT
+        NOT
+        NULL,
+        minecraft_nick
+        TEXT
+        NOT
+        NULL,
+        status
+        TEXT
+        DEFAULT
+        'completed',
+        created_at
+        TIMESTAMP
+        DEFAULT
+        CURRENT_TIMESTAMP,
+        FOREIGN
+        KEY
+                 (
+        user_id
+                 ) REFERENCES users
+                 (
+                     id
+                 ),
+        FOREIGN KEY
+                 (
+                     package_id
+                 ) REFERENCES packages
+                 (
+                     id
+                 ))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS packages
                  (
                      id
                      INTEGER
                      PRIMARY
                      KEY
                      AUTOINCREMENT,
-                     user_id
-                     INTEGER,
-                     session_token
+                     name
                      TEXT
-                     UNIQUE,
-                     created_at
-                     TEXT
-                 )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS transactions
-                 (
-                     id
-                     INTEGER
-                     PRIMARY
-                     KEY
-                     AUTOINCREMENT,
-                     user_id
-                     INTEGER,
-                     amount
-                     REAL,
-                     type
-                     TEXT,
+                     NOT
+                     NULL,
                      description
                      TEXT,
-                     created_at
+                     price
+                     REAL
+                     NOT
+                     NULL,
+                     duration
+                     INTEGER
+                     DEFAULT
+                     30,
+                     features
+                     TEXT,
+                     color
                      TEXT
+                     DEFAULT
+                     '#3b82f6',
+                     is_active
+                     BOOLEAN
+                     DEFAULT
+                     1
                  )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings
+                 (
+                     id
+                     INTEGER
+                     PRIMARY
+                     KEY
+                     AUTOINCREMENT,
+                     key
+                     TEXT
+                     UNIQUE
+                     NOT
+                     NULL,
+                     value
+                     TEXT
+                     NOT
+                     NULL
+                 )''')
+    admin_password = hashlib.sha256('admin123'.encode()).hexdigest()
+    c.execute(
+        'INSERT OR IGNORE INTO users (username, email, password, minecraft_nick, is_admin, balance) VALUES (?, ?, ?, ?, ?, ?)',
+        ('admin', 'admin@elitemc.uz', admin_password, 'SSmertnix', 1, 0))
+    packages = [
+
+        ('VIP', 'Boshlang\'ich daraja', 6000, 36500,
+         '/wb (verstak),/ec (enderchest),/disposal (chiqindi),Auksion 7ta slot,Region limiti 3ta,Maksimal uylar 2ta',
+         '#60a5fa'),
+
+
+        ('VIP+', 'Kengaytirilgan VIP', 13000, 36500,
+         '/anvil (sandan),/setwarp,/near,Kit VIP+,Auksion 10ta slot,Maksimal uylar 3ta', '#3b82f6'),
+
+
+        ('LEGEND', 'Afsonaviy status', 21000, 36500,
+         '/time set,/weather,Kit Legend,Auksion 14ta slot,Region limiti 5ta,Maksimal uylar 5ta', '#8b5cf6'),
+
+
+        ('DONATOR', 'Donater status', 28000, 36500,
+         '/jump,/clear (o\'zi),/afk,/anvil (rangli),Kit Donator,Auksion 20ta slot', '#d946ef'),
+
+
+        ('GOLD', 'Oltin status', 35000, 36500,
+         '/feed,/heal,/rename,Kit Gold,Region limiti 7ta,Auksion 30ta slot', '#eab308'),
+
+
+        ('NITRO', 'Tezkor status', 43000, 36500,
+         '/speed,/mute (sababli),/back,Kit Nitro,Region limiti 8ta,Auksion 40ta slot', '#f97316'),
+
+
+        ('COMET', 'Kometa darajasi', 56000, 36500,
+         '/bc (elon),/repair,Kit Comet,Maksimal uylar 10ta,Region limiti 9ta,Auksion 60ta slot', '#06b6d4'),
+
+
+        ('HERO', 'Qahramon darajasi', 79000, 36500,
+         '/mute (yechish),/prefix (o\'zgartirish),Kit Hero,Maksimal uylar 15ta,Region limiti 10ta,Auksion 70ta slot',
+         '#6366f1'),
+
+
+        ('ULTRA', 'Ultra imkoniyatlar', 100000, 36500,
+         '/ban (sababli),/unban,/repair all,Kit Ultra,/ec [nik],Auksion 80ta slot', '#ef4444'),
+
+
+        ('PRIME', 'Eng yuqori status', 200000, 36500,
+         '/fly,/tags,/tpa (0 sek),Kit Prime,Cheksiz Region Limit,Auksion 120ta slot', '#10b981')
+    ]
+    for pkg in packages:
+        c.execute(
+            'INSERT OR IGNORE INTO packages (name, description, price, duration, features, color) VALUES (?, ?, ?, ?, ?, ?)',
+            pkg)
+    default_settings = [
+        ('admin_card_number', '8600 1234 5678 9012'), ('admin_card_name', 'ADMIN ADMINOV'),
+        ('site_name', 'EliteMC.uz'), ('server_ip', 'play.elitemc.uz'),
+        ('rcon_host', 'localhost'), ('rcon_port', '25575'), ('rcon_password', 'your_rcon_password'),
+        ('discord_link', 'https://discord.gg/elitemc'), ('instagram_link', 'https://instagram.com/elitemc.uz'),
+        ('telegram_link', 'https://t.me/elitemc_uz'), ('youtube_link', 'https://youtube.com/@elitemc')
+    ]
+    for key, value in default_settings:
+        c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
     conn.commit()
     conn.close()
 
 
-init_db()
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
 
-# ===================== CONFIG =====================
-PTERODACTYL_URL = "https://panel.example.com"
-PTERODACTYL_API_KEY = "ptlc_your_api_key_here"
-
-PLANS = {
-    "proxy": {"ram": 2048, "cpu": 70, "disk": 5120, "price": 5000},
-    "rare": {"ram": 4096, "cpu": 100, "disk": 10240, "price": 20000},
-    "pro": {"ram": 8192, "cpu": 200, "disk": 25600, "price": 45000},
-    "boost": {"ram": 12288, "cpu": 300, "disk": 40960, "price": 70000},
-    "boost_plus": {"ram": 16384, "cpu": 300, "disk": 51200, "price": 120000},
-    "forest": {"ram": 20480, "cpu": 400, "disk": 71680, "price": 150000},
-    "forest_plus": {"ram": 24576, "cpu": 500, "disk": 92160, "price": 195000},
-    "vulcan": {"ram": 32768, "cpu": 700, "disk": 112640, "price": 260000}
-}
+    return decorated_function
 
 
-# ===================== AUTH HELPERS =====================
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        conn = sqlite3.connect('elitemc.db')
+        c = conn.cursor()
+        user = c.execute('SELECT is_admin FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+        conn.close()
+        if not user or not user[0]:
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+
+    return decorated_function
 
 
-def verify_session(session_token: Optional[str] = Cookie(None)):
-    if not session_token:
-        return None
-    conn = sqlite3.connect('hosting.db')
+def render_page(template_content, **kwargs):
+    conn = sqlite3.connect('elitemc.db')
     c = conn.cursor()
-    c.execute('SELECT user_id FROM sessions WHERE session_token = ?', (session_token,))
-    result = c.fetchone()
+    settings = {row[1]: row[2] for row in c.execute('SELECT * FROM settings').fetchall()}
     conn.close()
-    return result[0] if result else None
 
+    nav_user_section = ""
+    if kwargs.get('logged_in'):
+        nav_user_section = f"""
+                <li><a href="/balance">💰 Balans</a></li>
+                <li><a href="/profile">👤 Profil</a></li>
+                {'<li><a href="/admin">⚡ Admin</a></li>' if kwargs.get('is_admin') else ''}
+                <li><a href="/logout">🚪 Chiqish</a></li>
+        """
+    else:
+        nav_user_section = """
+                <li><a href="/login" class="btn btn-outline">🔐 Kirish</a></li>
+                <li><a href="/register" class="btn btn-primary">📝 Ro'yxat</a></li>
+        """
 
-def get_user_by_id(user_id: int):
-    conn = sqlite3.connect('hosting.db')
-    c = conn.cursor()
-    c.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return user
-
-
-# ===================== PTERODACTYL =====================
-def create_pterodactyl_server(server_name: str, plan: str, email: str):
-    plan_config = PLANS.get(plan)
-    headers = {
-        "Authorization": f"Bearer {PTERODACTYL_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    try:
-        server_data = {
-            "name": server_name,
-            "user": 1,
-            "egg": 1,
-            "docker_image": "ghcr.io/pterodactyl/yolks:java_17",
-            "startup": "java -Xms128M -Xmx{{SERVER_MEMORY}}M -jar {{SERVER_JARFILE}}",
-            "limits": {
-                "memory": plan_config['ram'],
-                "swap": 0,
-                "disk": plan_config['disk'],
-                "io": 500,
-                "cpu": plan_config['cpu']
-            }
-        }
-        response = requests.post(f"{PTERODACTYL_URL}/api/application/servers", headers=headers, json=server_data)
-        if response.status_code in [200, 201]:
-            return response.json()['attributes']['identifier']
-        return f"demo_{uuid.uuid4().hex[:8]}"
-    except:
-        return f"demo_{uuid.uuid4().hex[:8]}"
-
-
-# ===================== HOME PAGE =====================
-@app.get("/", response_class=HTMLResponse)
-async def home(session_token: Optional[str] = Cookie(None)):
-    user_id = verify_session(session_token)
-
-    return f"""
-<!DOCTYPE html>
+    return f'''<!DOCTYPE html>
 <html lang="uz">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ThemcHost.uz - Minecraft Hosting</title>
+    <title>EliteMC.uz - O\'zbekistonning Eng Yaxshi Minecraft Serveri</title>
+    <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600;700&family=Space+Grotesk:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root {{
+            --primary: #00ff88; --primary-glow: rgba(0, 255, 136, 0.5); --secondary: #0099ff;
+            --accent: #ff0099; --dark: #0a0e1a; --dark-card: #141824; --dark-hover: #1e2330;
+            --text: #e0e6ed; --text-dim: #8b92a8; --success: #00ff88; --warning: #ffaa00;
+            --danger: #ff3366; --purple: #8b5cf6; --gold: #ffd700;
         }}
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Rajdhani', sans-serif; background: var(--dark); color: var(--text);
+               line-height: 1.6; overflow-x: hidden; position: relative; min-height: 100vh; }}
+        body::before {{ content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-image: linear-gradient(rgba(0, 255, 136, 0.03) 1px, transparent 1px),
+                            linear-gradient(90deg, rgba(0, 255, 136, 0.03) 1px, transparent 1px);
+            background-size: 50px 50px; pointer-events: none; z-index: 0;
+            animation: gridMove 20s linear infinite; }}
+        @keyframes gridMove {{ 0% {{ transform: translateY(0); }} 100% {{ transform: translateY(50px); }} }}
+        body::after {{ content: ''; position: fixed; top: -50%; left: -50%; width: 200%; height: 200%;
+            background: radial-gradient(circle at 20% 30%, rgba(0, 255, 136, 0.08) 0%, transparent 25%),
+                       radial-gradient(circle at 80% 70%, rgba(0, 153, 255, 0.08) 0%, transparent 25%),
+                       radial-gradient(circle at 50% 50%, rgba(255, 0, 153, 0.05) 0%, transparent 25%);
+            pointer-events: none; z-index: 0; animation: orbRotate 30s linear infinite; }}
+        @keyframes orbRotate {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+        .container {{ max-width: 1400px; margin: 0 auto; padding: 0 2rem; position: relative; z-index: 2; }}
+   nav {{ 
+        background: rgba(10, 14, 26, 0.95);
+        backdrop-filter: blur(15px);
+        border-bottom: 1px solid rgba(0, 255, 136, 0.1); 
+        position: fixed;
+        top: 0; 
+        left: 0;
+        width: 100%;
+        z-index: 9999;
+        box-shadow: 0 5px 20px rgba(0, 0, 0, 0.8); 
+    }}
 
-        body {{
-            font-family: 'Inter', 'Segoe UI', sans-serif;
-            background: #0a0a0a;
-            color: #fff;
-            overflow-x: hidden;
+    .hero {{ 
+        padding: 12rem 0 6rem 0;
+        text-align: center; 
+        position: relative; 
+        overflow: hidden; 
+        margin-top: 0;
+    }}
+    
+    main {{ padding-top: 80px; }}
+        nav .container {{ display: flex; justify-content: space-between; align-items: center; padding: 1.2rem 2rem; }}
+        .logo {{ font-family: 'Orbitron', sans-serif; font-size: 2rem; font-weight: 900;
+                background: linear-gradient(135deg, var(--primary), var(--secondary));
+                -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+                text-shadow: 0 0 30px var(--primary-glow); letter-spacing: 2px; position: relative;
+                animation: logoGlow 3s ease-in-out infinite; }}
+        @keyframes logoGlow {{ 0%, 100% {{ filter: brightness(1); }} 50% {{ filter: brightness(1.3); }} }}
+        .logo::before {{ content: '⚔'; margin-right: 10px; font-size: 1.5rem; animation: swordFloat 2s ease-in-out infinite; }}
+        @keyframes swordFloat {{ 0%, 100% {{ transform: translateY(0) rotate(0deg); }} 50% {{ transform: translateY(-5px) rotate(5deg); }} }}
+        .nav-links {{ display: flex; gap: 2rem; align-items: center; list-style: none; }}
+        .nav-links a {{ color: var(--text); text-decoration: none; font-weight: 600; font-size: 1.1rem;
+                       padding: 0.5rem 1.2rem; border-radius: 8px; transition: all 0.3s ease;
+                       position: relative; overflow: hidden; }}
+        .nav-links a::before {{ content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+                               background: linear-gradient(90deg, transparent, var(--primary-glow), transparent);
+                               transition: left 0.5s; }}
+        .nav-links a:hover::before {{ left: 100%; }}
+        .nav-links a:hover {{ color: var(--primary); background: rgba(0, 255, 136, 0.1); transform: translateY(-2px); }}
+        .nav-links .btn {{ background: linear-gradient(135deg, var(--primary), var(--secondary));
+                          color: var(--dark); font-weight: 700; box-shadow: 0 5px 20px var(--primary-glow); }}
+        .nav-links .btn:hover {{ transform: translateY(-2px) scale(1.05); box-shadow: 0 8px 30px var(--primary-glow); }}
+        .hero {{ padding: 8rem 0; text-align: center; position: relative; overflow: hidden; }}
+        .hero::before {{ content: ''; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                        width: 800px; height: 800px; background: radial-gradient(circle, var(--primary-glow) 0%, transparent 70%);
+                        opacity: 0.3; animation: pulse 4s ease-in-out infinite; }}
+        @keyframes pulse {{ 0%, 100% {{ transform: translate(-50%, -50%) scale(1); opacity: 0.3; }}
+                           50% {{ transform: translate(-50%, -50%) scale(1.2); opacity: 0.5; }} }}
+        .hero h1 {{ font-family: 'Orbitron', sans-serif; font-size: 4.5rem; font-weight: 900; margin-bottom: 1.5rem;
+                   background: linear-gradient(135deg, #fff, var(--primary), var(--secondary));
+                   -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+                   animation: titleSlide 1s ease-out; position: relative; z-index: 1; }}
+        @keyframes titleSlide {{ from {{ opacity: 0; transform: translateY(-50px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+        .hero p {{ font-size: 1.5rem; color: var(--text-dim); margin-bottom: 2rem; animation: fadeInUp 1s ease-out 0.3s both; }}
+        @keyframes fadeInUp {{ from {{ opacity: 0; transform: translateY(30px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+        .server-ip {{ display: inline-block; background: linear-gradient(135deg, rgba(0, 255, 136, 0.2), rgba(0, 153, 255, 0.2));
+                     padding: 1.5rem 3rem; border-radius: 15px; border: 2px solid var(--primary);
+                     font-family: 'Space Grotesk', monospace; font-size: 1.8rem; font-weight: 700; color: var(--primary);
+                     margin: 2rem 0; box-shadow: 0 10px 40px var(--primary-glow); animation: fadeInUp 1s ease-out 0.6s both;
+                     cursor: pointer; transition: all 0.3s ease; }}
+        .server-ip:hover {{ transform: scale(1.05); box-shadow: 0 15px 50px var(--primary-glow); }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 2rem; margin: 4rem 0; }}
+        .stat-card {{ background: linear-gradient(135deg, var(--dark-card), var(--dark-hover)); padding: 2.5rem;
+                     border-radius: 20px; text-align: center; border: 1px solid rgba(0, 255, 136, 0.2);
+                     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); transition: all 0.4s ease; position: relative; overflow: hidden; }}
+        .stat-card::before {{ content: ''; position: absolute; top: -50%; left: -50%; width: 200%; height: 200%;
+                             background: linear-gradient(45deg, transparent, var(--primary-glow), transparent);
+                             transform: rotate(45deg); transition: all 0.6s; opacity: 0; }}
+        .stat-card:hover::before {{ opacity: 1; animation: shine 1.5s ease-in-out; }}
+        @keyframes shine {{ 0% {{ transform: translateX(-100%) translateY(-100%) rotate(45deg); }}
+                           100% {{ transform: translateX(100%) translateY(100%) rotate(45deg); }} }}
+        .stat-card:hover {{ transform: translateY(-10px) scale(1.02); border-color: var(--primary);
+                           box-shadow: 0 20px 50px rgba(0, 255, 136, 0.3); }}
+        .stat-card i {{ font-size: 3.5rem; color: var(--primary); margin-bottom: 1rem; display: block;
+                       animation: iconBounce 2s ease-in-out infinite; }}
+        @keyframes iconBounce {{ 0%, 100% {{ transform: translateY(0); }} 50% {{ transform: translateY(-10px); }} }}
+        .stat-card h3 {{ font-size: 3rem; font-weight: 800; color: var(--primary); margin: 1rem 0; font-family: 'Orbitron', sans-serif; }}
+        .stat-card p {{ color: var(--text-dim); font-size: 1.1rem; font-weight: 500; }}
+        .section-title {{ text-align: center; margin: 5rem 0 3rem; position: relative; }}
+        .section-title h2 {{ font-family: 'Orbitron', sans-serif; font-size: 3.5rem; font-weight: 900;
+                            background: linear-gradient(135deg, var(--primary), var(--secondary));
+                            -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+                            position: relative; display: inline-block; }}
+        .section-title h2::after {{ content: ''; position: absolute; bottom: -15px; left: 50%; transform: translateX(-50%);
+                                    width: 100px; height: 4px; background: linear-gradient(90deg, transparent, var(--primary), transparent);
+                                    border-radius: 2px; }}
+        .packages {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 2.5rem; margin: 4rem 0; }}
+        .package-card {{ background: linear-gradient(135deg, var(--dark-card), var(--dark-hover)); border-radius: 25px;
+                        padding: 3rem 2rem; border: 2px solid transparent; transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+                        position: relative; overflow: hidden; box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5); }}
+        .package-card::before {{ content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+                                background: linear-gradient(135deg, var(--primary-glow), rgba(0, 153, 255, 0.2));
+                                opacity: 0; transition: opacity 0.4s; }}
+        .package-card:hover {{ transform: translateY(-15px) scale(1.03); border-color: var(--primary);
+                              box-shadow: 0 25px 60px rgba(0, 255, 136, 0.4); }}
+        .package-card:hover::before {{ opacity: 0.1; }}
+        .package-name {{ font-family: 'Orbitron', sans-serif; font-size: 2.5rem; font-weight: 900; margin-bottom: 1rem;
+                        text-align: center; position: relative; z-index: 1; }}
+        .package-price {{ font-size: 3rem; font-weight: 800; text-align: center; margin: 1.5rem 0; color: var(--primary);
+                         font-family: 'Orbitron', sans-serif; position: relative; z-index: 1; }}
+        .package-desc {{ text-align: center; color: var(--text-dim); margin-bottom: 2rem; font-size: 1.1rem;
+                        position: relative; z-index: 1; }}
+        .package-features {{ list-style: none; margin: 2rem 0; position: relative; z-index: 1; }}
+        .package-features li {{ padding: 0.8rem 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+                               display: flex; align-items: center; gap: 0.8rem; transition: all 0.3s; }}
+        .package-features li:hover {{ padding-left: 10px; color: var(--primary); }}
+        .package-features li i {{ color: var(--primary); font-size: 1.2rem; }}
+        .package-duration {{ text-align: center; margin: 1.5rem 0; padding: 0.8rem; background: rgba(0, 255, 136, 0.1);
+                            border-radius: 10px; color: var(--primary); font-weight: 600; position: relative; z-index: 1; }}
+        .btn {{ display: inline-block; padding: 1rem 2.5rem; border-radius: 12px; font-weight: 700; font-size: 1.1rem;
+               text-decoration: none; transition: all 0.3s ease; border: none; cursor: pointer; position: relative;
+               overflow: hidden; z-index: 1; }}
+        .btn::before {{ content: ''; position: absolute; top: 50%; left: 50%; width: 0; height: 0; border-radius: 50%;
+                       background: rgba(255, 255, 255, 0.2); transform: translate(-50%, -50%);
+                       transition: width 0.6s, height 0.6s; z-index: -1; }}
+        .btn:hover::before {{ width: 300px; height: 300px; }}
+        .btn-primary {{ background: linear-gradient(135deg, var(--primary), var(--secondary)); color: var(--dark);
+                       box-shadow: 0 10px 30px var(--primary-glow); }}
+        .btn-primary:hover {{ transform: translateY(-3px) scale(1.05); box-shadow: 0 15px 40px var(--primary-glow); }}
+        .btn-secondary {{ background: linear-gradient(135deg, var(--purple), var(--accent)); color: white;
+                         box-shadow: 0 10px 30px rgba(139, 92, 246, 0.4); }}
+        .btn-secondary:hover {{ transform: translateY(-3px) scale(1.05); box-shadow: 0 15px 40px rgba(139, 92, 246, 0.6); }}
+        .btn-outline {{ background: transparent; border: 2px solid var(--primary); color: var(--primary); }}
+        .btn-outline:hover {{ background: var(--primary); color: var(--dark); transform: translateY(-3px); }}
+        .btn-full {{ width: 100%; text-align: center; }}
+        .form-group {{ margin-bottom: 2rem; }}
+        .form-group label {{ display: block; margin-bottom: 0.8rem; color: var(--text); font-weight: 600; font-size: 1.1rem; }}
+        .form-group label i {{ margin-right: 0.5rem; color: var(--primary); }}
+        .form-group input, .form-group textarea, .form-group select {{
+            width: 100%; padding: 1.2rem; background: rgba(255, 255, 255, 0.05); border: 2px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px; color: var(--text); font-size: 1.1rem; transition: all 0.3s; font-family: 'Rajdhani', sans-serif;
         }}
-
-        /* Navigation */
-        nav {{
-            background: rgba(0, 0, 0, 0.95);
-            backdrop-filter: blur(10px);
-            padding: 15px 0;
-            border-bottom: 1px solid rgba(0, 255, 0, 0.2);
-            position: sticky;
-            top: 0;
-            z-index: 1000;
+        .form-group input:focus, .form-group textarea:focus, .form-group select:focus {{
+            outline: none; border-color: var(--primary); background: rgba(0, 255, 136, 0.05); box-shadow: 0 0 20px var(--primary-glow);
         }}
-
-        .nav-container {{
-            max-width: 1400px;
-            margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 0 30px;
-        }}
-
-        .logo {{
-            font-size: 1.8em;
-            font-weight: 700;
-            color: #00ff00;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-
-        .nav-links {{
-            display: flex;
-            gap: 35px;
-            align-items: center;
-        }}
-
-        .nav-links a {{
-            color: #fff;
-            text-decoration: none;
-            font-weight: 500;
-            transition: all 0.3s;
-            font-size: 0.95em;
-        }}
-
-        .nav-links a:hover {{
-            color: #00ff00;
-        }}
-
-        .auth-buttons {{
-            display: flex;
-            gap: 15px;
-        }}
-
-        .btn {{
-            padding: 10px 25px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-            transition: all 0.3s;
-            border: none;
-            cursor: pointer;
-            font-size: 0.95em;
-        }}
-
-        .btn-login {{
-            background: transparent;
-            color: #00ff00;
-            border: 2px solid #00ff00;
-        }}
-
-        .btn-login:hover {{
-            background: rgba(0, 255, 0, 0.1);
-        }}
-
-        .btn-register {{
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            border: none;
-        }}
-
-        .btn-register:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(0, 255, 0, 0.4);
-        }}
-
-        .btn-dashboard {{
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-        }}
-
-        /* Hero */
-        .hero {{
-            padding: 120px 30px;
-            text-align: center;
-            background: linear-gradient(135deg, rgba(0, 0, 0, 0.9), rgba(0, 255, 0, 0.05));
-            position: relative;
-            overflow: hidden;
-        }}
-
-        .hero::before {{
-            content: '';
-            position: absolute;
-            width: 500px;
-            height: 500px;
-            background: radial-gradient(circle, rgba(0, 255, 0, 0.1), transparent);
-            top: -250px;
-            right: -250px;
-            animation: pulse 4s infinite;
-        }}
-
-        @keyframes pulse {{
-            0%, 100% {{ transform: scale(1); opacity: 0.5; }}
-            50% {{ transform: scale(1.2); opacity: 0.8; }}
-        }}
-
-        .hero h1 {{
-            font-size: 4em;
-            margin-bottom: 20px;
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            font-weight: 800;
-        }}
-
-        .hero p {{
-            font-size: 1.3em;
-            color: #aaa;
-            margin-bottom: 40px;
-            max-width: 600px;
-            margin-left: auto;
-            margin-right: auto;
-        }}
-
-        .hero-cta {{
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            padding: 18px 45px;
-            font-size: 1.2em;
-            border: none;
-            border-radius: 50px;
-            cursor: pointer;
-            font-weight: 700;
-            transition: all 0.3s;
-            text-decoration: none;
-            display: inline-block;
-        }}
-
-        .hero-cta:hover {{
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
-        }}
-
-        /* Stats */
-        .stats {{
-            background: #111;
-            padding: 60px 30px;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 40px;
-            max-width: 1400px;
-            margin: 0 auto;
-        }}
-
-        .stat-item {{
-            text-align: center;
-        }}
-
-        .stat-number {{
-            font-size: 3em;
-            color: #00ff00;
-            font-weight: 700;
-        }}
-
-        .stat-label {{
-            color: #888;
-            font-size: 1.1em;
-            margin-top: 10px;
-        }}
-
-        /* Plans */
-        .plans {{
-            max-width: 1400px;
-            margin: 80px auto;
-            padding: 0 30px;
-        }}
-
-        .section-title {{
-            text-align: center;
-            font-size: 3em;
-            margin-bottom: 60px;
-            color: #00ff00;
-            font-weight: 700;
-        }}
-
-        .plans-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 25px;
-        }}
-
-        .plan-card {{
-            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
-            border: 1px solid rgba(0, 255, 0, 0.3);
-            border-radius: 20px;
-            padding: 40px 30px;
-            text-align: center;
-            transition: all 0.4s;
-            position: relative;
-            overflow: hidden;
-        }}
-
-        .plan-card::before {{
-            content: '';
-            position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(0, 255, 0, 0.1), transparent);
-            transition: 0.5s;
-        }}
-
-        .plan-card:hover::before {{
-            left: 100%;
-        }}
-
-        .plan-card:hover {{
-            transform: translateY(-10px);
-            border-color: #00ff00;
-            box-shadow: 0 15px 40px rgba(0, 255, 0, 0.3);
-        }}
-
-        .plan-badge {{
-            display: inline-block;
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 0.85em;
-            font-weight: 700;
-            margin-bottom: 15px;
-        }}
-
-        .plan-name {{
-            font-size: 1.8em;
-            color: #00ff00;
-            margin-bottom: 20px;
-            font-weight: 700;
-        }}
-
-        .plan-price {{
-            font-size: 2.5em;
-            color: #fff;
-            margin-bottom: 10px;
-            font-weight: 700;
-        }}
-
-        .plan-period {{
-            color: #888;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-        }}
-
-        .plan-features {{
-            list-style: none;
-            margin-bottom: 30px;
-            text-align: left;
-        }}
-
-        .plan-features li {{
-            padding: 12px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            color: #ccc;
-            font-size: 1em;
-        }}
-
-        .plan-features li:last-child {{
-            border-bottom: none;
-        }}
-
-        .select-plan {{
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            padding: 14px 35px;
-            border: none;
-            border-radius: 30px;
-            cursor: pointer;
-            font-weight: 700;
-            transition: all 0.3s;
-            font-size: 1em;
-            width: 100%;
-        }}
-
-        .select-plan:hover {{
-            transform: scale(1.05);
-            box-shadow: 0 8px 25px rgba(0, 255, 0, 0.5);
-        }}
-
-        /* Features */
-        .features {{
-            background: #111;
-            padding: 80px 30px;
-        }}
-
-        .features-grid {{
-            max-width: 1400px;
-            margin: 0 auto;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 30px;
-            margin-top: 60px;
-        }}
-
-        .feature-card {{
-            background: rgba(0, 255, 0, 0.05);
-            border: 1px solid rgba(0, 255, 0, 0.2);
-            border-radius: 15px;
-            padding: 40px;
-            text-align: center;
-            transition: all 0.3s;
-        }}
-
-        .feature-card:hover {{
-            transform: translateY(-5px);
-            border-color: #00ff00;
-            background: rgba(0, 255, 0, 0.1);
-        }}
-
-        .feature-icon {{
-            font-size: 3.5em;
-            margin-bottom: 20px;
-        }}
-
-        .feature-title {{
-            color: #00ff00;
-            font-size: 1.5em;
-            margin-bottom: 15px;
-            font-weight: 700;
-        }}
-
-        .feature-desc {{
-            color: #aaa;
-            line-height: 1.6;
-        }}
-
-        /* Footer */
-        footer {{
-            background: #000;
-            padding: 50px 30px;
-            text-align: center;
-            border-top: 1px solid rgba(0, 255, 0, 0.2);
-        }}
-
-        .footer-content {{
-            max-width: 1400px;
-            margin: 0 auto;
-        }}
-
-        .footer-links {{
-            display: flex;
-            justify-content: center;
-            gap: 40px;
-            margin-top: 30px;
-            flex-wrap: wrap;
-        }}
-
-        .footer-links a {{
-            color: #00ff00;
-            text-decoration: none;
-            transition: all 0.3s;
-            font-size: 1.1em;
-        }}
-
-        .footer-links a:hover {{
-            color: #00cc00;
-        }}
-
-        /* Responsive */
+        .card {{ background: linear-gradient(135deg, var(--dark-card), var(--dark-hover)); border-radius: 20px; padding: 2.5rem;
+                border: 1px solid rgba(0, 255, 136, 0.2); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); margin-bottom: 2rem; }}
+        .card-header {{ border-bottom: 2px solid rgba(0, 255, 136, 0.2); padding-bottom: 1.5rem; margin-bottom: 2rem; }}
+        .card-header h2 {{ font-family: 'Orbitron', sans-serif; font-size: 2rem; color: var(--primary); }}
+        table {{ width: 100%; border-collapse: separate; border-spacing: 0; margin: 2rem 0; }}
+        table thead {{ background: linear-gradient(135deg, var(--primary), var(--secondary)); }}
+        table thead th {{ padding: 1.5rem; text-align: left; color: var(--dark); font-weight: 700; font-size: 1.1rem;
+                         font-family: 'Orbitron', sans-serif; }}
+        table thead th:first-child {{ border-radius: 12px 0 0 0; }}
+        table thead th:last-child {{ border-radius: 0 12px 0 0; }}
+        table tbody tr {{ background: var(--dark-card); transition: all 0.3s; }}
+        table tbody tr:hover {{ background: var(--dark-hover); transform: scale(1.01); box-shadow: 0 5px 15px rgba(0, 255, 136, 0.2); }}
+        table tbody td {{ padding: 1.5rem; border-bottom: 1px solid rgba(255, 255, 255, 0.05); }}
+        .badge {{ display: inline-block; padding: 0.5rem 1.2rem; border-radius: 20px; font-size: 0.9rem; font-weight: 700;
+                 text-transform: uppercase; letter-spacing: 1px; }}
+        .badge-pending {{ background: rgba(255, 170, 0, 0.2); color: var(--warning); border: 1px solid var(--warning); }}
+        .badge-approved {{ background: rgba(0, 255, 136, 0.2); color: var(--success); border: 1px solid var(--success); }}
+        .badge-rejected {{ background: rgba(255, 51, 102, 0.2); color: var(--danger); border: 1px solid var(--danger); }}
+        .balance-display {{ background: linear-gradient(135deg, var(--purple), var(--accent)); padding: 3rem; border-radius: 20px;
+                           text-align: center; margin: 2rem 0; box-shadow: 0 15px 40px rgba(139, 92, 246, 0.4);
+                           position: relative; overflow: hidden; }}
+        .balance-display::before {{ content: ''; position: absolute; top: -50%; right: -50%; width: 200%; height: 200%;
+                                    background: linear-gradient(45deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+                                    animation: shimmer 3s infinite; }}
+        @keyframes shimmer {{ 0% {{ transform: translateX(-100%) translateY(-100%) rotate(45deg); }}
+                             100% {{ transform: translateX(100%) translateY(100%) rotate(45deg); }} }}
+        .balance-display h3 {{ font-size: 1.3rem; margin-bottom: 1rem; opacity: 0.9; }}
+        .balance-amount {{ font-family: 'Orbitron', sans-serif; font-size: 4rem; font-weight: 900; color: white;
+                          text-shadow: 0 5px 20px rgba(0, 0, 0, 0.5); }}
+        .alert {{ padding: 1.5rem; border-radius: 12px; margin: 2rem 0; border-left: 5px solid; display: flex;
+                 align-items: center; gap: 1rem; animation: slideIn 0.5s ease-out; }}
+        @keyframes slideIn {{ from {{ opacity: 0; transform: translateX(-20px); }} to {{ opacity: 1; transform: translateX(0); }} }}
+        .alert-warning {{ background: rgba(255, 170, 0, 0.1); border-color: var(--warning); color: var(--warning); }}
+        .alert-info {{ background: rgba(0, 153, 255, 0.1); border-color: var(--secondary); color: var(--secondary); }}
+        .alert i {{ font-size: 2rem; }}
+        .tabs {{ display: flex; gap: 1rem; margin: 2rem 0; flex-wrap: wrap; }}
+        .tab {{ padding: 1rem 2rem; background: var(--dark-card); border: 2px solid transparent; border-radius: 12px;
+               color: var(--text-dim); text-decoration: none; font-weight: 600; transition: all 0.3s; display: flex;
+               align-items: center; gap: 0.5rem; }}
+        .tab:hover {{ background: var(--dark-hover); color: var(--primary); border-color: var(--primary); transform: translateY(-2px); }}
+        .tab.active {{ background: linear-gradient(135deg, var(--primary), var(--secondary)); color: var(--dark);
+                      border-color: var(--primary); font-weight: 700; }}
+        footer {{ background: linear-gradient(180deg, var(--dark), var(--dark-card)); border-top: 2px solid rgba(0, 255, 136, 0.2);
+                 margin-top: 8rem; padding: 4rem 0 2rem; position: relative; }}
+        footer::before {{ content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 2px;
+                         background: linear-gradient(90deg, transparent, var(--primary), var(--secondary), var(--accent), transparent);
+                         animation: lineGlow 3s ease-in-out infinite; }}
+        @keyframes lineGlow {{ 0%, 100% {{ opacity: 0.5; }} 50% {{ opacity: 1; }} }}
+        .footer-content {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 3rem; margin-bottom: 3rem; }}
+        .footer-section h3 {{ font-family: 'Orbitron', sans-serif; font-size: 1.5rem; margin-bottom: 1.5rem; color: var(--primary); }}
+        .footer-section p {{ color: var(--text-dim); line-height: 1.8; margin-bottom: 1rem; }}
+        .social-links {{ display: flex; gap: 1.5rem; margin-top: 2rem; }}
+        .social-link {{ display: flex; align-items: center; justify-content: center; width: 50px; height: 50px;
+                       background: linear-gradient(135deg, var(--dark-card), var(--dark-hover));
+                       border: 2px solid rgba(0, 255, 136, 0.3); border-radius: 12px; color: var(--primary);
+                       font-size: 1.5rem; transition: all 0.3s ease; text-decoration: none; }}
+        .social-link:hover {{ background: linear-gradient(135deg, var(--primary), var(--secondary)); color: var(--dark);
+                             transform: translateY(-5px) rotate(5deg); box-shadow: 0 10px 30px var(--primary-glow); }}
+        .social-link.discord:hover {{ background: linear-gradient(135deg, #5865F2, #7289DA); box-shadow: 0 10px 30px rgba(88, 101, 242, 0.5); }}
+        .social-link.instagram:hover {{ background: linear-gradient(135deg, #E1306C, #F77737, #FCAF45); box-shadow: 0 10px 30px rgba(225, 48, 108, 0.5); }}
+        .social-link.telegram:hover {{ background: linear-gradient(135deg, #0088cc, #00aced); box-shadow: 0 10px 30px rgba(0, 136, 204, 0.5); }}
+        .social-link.youtube:hover {{ background: linear-gradient(135deg, #FF0000, #CC0000); box-shadow: 0 10px 30px rgba(255, 0, 0, 0.5); }}
+        .footer-bottom {{ text-align: center; padding-top: 2rem; border-top: 1px solid rgba(0, 255, 136, 0.1); color: var(--text-dim); }}
+        .footer-bottom p {{ font-size: 1.1rem; font-weight: 500; }}
+        .copyright {{ margin-top: 1rem; font-size: 0.95rem; opacity: 0.7; }}
+        .notification {{ position: fixed; top: 100px; right: 2rem; background: linear-gradient(135deg, var(--dark-card), var(--dark-hover));
+                        padding: 1.5rem 2rem; border-radius: 12px; border-left: 5px solid var(--primary);
+                        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5); z-index: 10000; animation: slideInRight 0.5s ease-out; }}
+        @keyframes slideInRight {{ from {{ opacity: 0; transform: translateX(100%); }} to {{ opacity: 1; transform: translateX(0); }} }}
+        .file-upload {{ position: relative; display: inline-block; width: 100%; }}
+        .file-upload input[type="file"] {{ position: absolute; opacity: 0; width: 100%; height: 100%; cursor: pointer; }}
+        .file-upload-label {{ display: block; padding: 1.5rem; background: rgba(0, 255, 136, 0.1);
+                             border: 2px dashed var(--primary); border-radius: 12px; text-align: center;
+                             cursor: pointer; transition: all 0.3s; }}
+        .file-upload-label:hover {{ background: rgba(0, 255, 136, 0.2); border-color: var(--secondary); }}
+        .file-upload-label i {{ font-size: 2rem; color: var(--primary); display: block; margin-bottom: 0.5rem; }}
+        .image-preview {{ max-width: 100%; border-radius: 12px; border: 2px solid var(--primary); margin-top: 1rem; }}
         @media (max-width: 768px) {{
-            .hero h1 {{
-                font-size: 2.5em;
-            }}
-            .nav-links {{
-                display: none;
-            }}
-            .plans-grid {{
-                grid-template-columns: 1fr;
-            }}
+            .hero h1 {{ font-size: 2.5rem; }}
+            .hero p {{ font-size: 1.2rem; }}
+            .server-ip {{ font-size: 1.3rem; padding: 1rem 2rem; }}
+            .nav-links {{ flex-direction: column; gap: 0.5rem; }}
+            .stats {{ grid-template-columns: 1fr; }}
+            .packages {{ grid-template-columns: 1fr; }}
+            .tabs {{ flex-direction: column; }}
+            table {{ font-size: 0.9rem; }}
+            table thead th, table tbody td {{ padding: 1rem; }}
         }}
     </style>
 </head>
 <body>
     <nav>
-        <div class="nav-container">
-            <div class="logo">⛏️ ThemcHost.uz</div>
-            <div class="nav-links">
-                <a href="#plans">Tariflar</a>
-                <a href="#features">Imkoniyatlar</a>
-                <a href="#about">Biz haqimizda</a>
-            </div>
-            <div class="auth-buttons">
-                {'<a href="/dashboard" class="btn btn-dashboard">Dashboard</a>' if user_id else '<a href="/login" class="btn btn-login">Kirish</a><a href="/register" class="btn btn-register">Royxatdan otish</a>'}
-            </div>
+        <div class="container">
+            <div class="logo">EliteMC</div>
+            <ul class="nav-links">
+                <li><a href="/">🏠 Asosiy</a></li>
+                <li><a href="/shop">🛒 Do'kon</a></li>
+                {nav_user_section}
+            </ul>
         </div>
     </nav>
-
-    <section class="hero">
-        <h1>O'zbekistondagi #1 Minecraft Hosting</h1>
-        <p>Yuqori tezlik, ishonchlilik va professional texnik yordam bilan serveringizni bugun yarating</p>
-        <a href="{'#plans' if not user_id else '/dashboard'}" class="hero-cta">Serveringizni Yarating</a>
-    </section>
-
-    <section class="stats">
-        <div class="stat-item">
-            <div class="stat-number">1500+</div>
-            <div class="stat-label">Faol Serverlar</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-number">5000+</div>
-            <div class="stat-label">Mijozlar</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-number">99.9%</div>
-            <div class="stat-label">Uptime</div>
-        </div>
-        <div class="stat-item">
-            <div class="stat-number">24/7</div>
-            <div class="stat-label">Qo'llab-quvvatlash</div>
-        </div>
-    </section>
-
-    <section class="plans" id="plans">
-        <h2 class="section-title">Tariflar</h2>
-        <div class="plans-grid">
-            <div class="plan-card">
-                <div class="plan-name">🔷 PROXY</div>
-                <div class="plan-price">5.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 70% CPU</li>
-                    <li>⭐ 2GB RAM</li>
-                    <li>💾 5GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <div class="plan-name">🔷 RARE</div>
-                <div class="plan-price">20.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 100% CPU</li>
-                    <li>⭐ 4GB RAM</li>
-                    <li>💾 10GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <span class="plan-badge">🔥 RECOMMEND</span>
-                <div class="plan-name">🔷 PRO</div>
-                <div class="plan-price">45.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 200% CPU</li>
-                    <li>⭐ 8GB RAM</li>
-                    <li>💾 25GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>🎁 Plugin Install</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <div class="plan-name">🔷 BOOST</div>
-                <div class="plan-price">70.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 300% CPU</li>
-                    <li>⭐ 12GB RAM</li>
-                    <li>💾 40GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>🎁 Plugin Install</li>
-                    <li>🚀 DDoS Protection</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <div class="plan-name">🔷 BOOST+</div>
-                <div class="plan-price">120.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 300% CPU</li>
-                    <li>⭐ 16GB RAM</li>
-                    <li>💾 50GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>🎁 Plugin Install</li>
-                    <li>🚀 DDoS Protection</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <div class="plan-name">✨ FOREST</div>
-                <div class="plan-price">150.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 400% CPU</li>
-                    <li>⭐ 20GB RAM</li>
-                    <li>💾 70GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>🎁 Plugin Install</li>
-                    <li>🚀 DDoS Protection</li>
-                    <li>⭐ Premium Support</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <div class="plan-name">✨ FOREST+</div>
-                <div class="plan-price">195.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 500% CPU</li>
-                    <li>⭐ 24GB RAM</li>
-                    <li>💾 90GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>🎁 Plugin Install</li>
-                    <li>🚀 DDoS Protection</li>
-                    <li>⭐ Premium Support</li>
-                    <li>📞 24/7 Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-
-            <div class="plan-card">
-                <span class="plan-badge">👑 VIP</span>
-                <div class="plan-name">🔺 VULCAN</div>
-                <div class="plan-price">260.000</div>
-                <div class="plan-period">UZS/oyiga</div>
-                <ul class="plan-features">
-                    <li>⚡ 700% CPU</li>
-                    <li>⭐ 32GB RAM</li>
-                    <li>💾 110GB SSD</li>
-                    <li>🔄 Auto Backup</li>
-                    <li>🎁 Plugin Install</li>
-                    <li>🚀 DDoS Protection</li>
-                    <li>👑 VIP Support</li>
-                    <li>⭐ Premium Support</li>
-                </ul>
-                <button class="select-plan" onclick="location.href='/{"dashboard" if user_id else "register"}'">Tanlash</button>
-            </div>
-        </div>
-    </section>
-
-    <section class="features" id="features">
-        <h2 class="section-title">Bizning Afzalliklarimiz</h2>
-        <div class="features-grid">
-            <div class="feature-card">
-                <div class="feature-icon">⚡</div>
-                <div class="feature-title">Yuqori Tezlik</div>
-                <div class="feature-desc">NVMe SSD va yuqori tezlikdagi tarmoq</div>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">🛡️</div>
-                <div class="feature-title">DDoS Himoya</div>
-                <div class="feature-desc">Professional DDoS hujumlardan himoya</div>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">🔄</div>
-                <div class="feature-title">Auto Backup</div>
-                <div class="feature-desc">Kundalik avtomatik zaxira nusxa</div>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">🎮</div>
-                <div class="feature-title">1-Click Install</div>
-                <div class="feature-desc">Mod va pluginlarni oson o'rnatish</div>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">📊</div>
-                <div class="feature-title">Monitoring</div>
-                <div class="feature-desc">Real-time server monitoring</div>
-            </div>
-            <div class="feature-card">
-                <div class="feature-icon">💬</div>
-                <div class="feature-title">24/7 Support</div>
-                <div class="feature-desc">Telegram orqali doimiy yordam</div>
-            </div>
-        </div>
-    </section>
-
-    <footer id="about">
-            <div class="footer-links">
-                <a href="https://t.me/TheMC_Uz" target="_blank">Telegram</a>
-                <a href="https://instagram.com/themchost" target="_blank">Instagram</a>
-                <a href="https://discord.gg/ABCDE" target="_blank">Discord</a>
-                <a href="/terms.html">Umumiy shartlar</a>
+    <main>{template_content}</main>
+    <footer>
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h3>⚔️ EliteMC.uz</h3>
+                    <p>O'zbekistonning eng yaxshi va eng mashhur Minecraft serveri. Bizning serverimizda siz ajoyib o'yinchilar jamoasi bilan birga o'ynashingiz va yangi do'stlar orttirishingiz mumkin!</p>
+                    <p><strong>Server IP:</strong> {settings.get('server_ip', 'play.elitemc.uz')}</p>
                 </div>
+                <div class="footer-section">
+                    <h3>🔗 Sahifalar</h3>
+                    <ul style="list-style: none;">
+                        <li style="margin: 0.5rem 0;"><a href="/" style="color: var(--text-dim); text-decoration: none; transition: all 0.3s;" onmouseover="this.style.color='var(--primary)'" onmouseout="this.style.color='var(--text-dim)'">🏠 Bosh sahifa</a></li>
+                        <li style="margin: 0.5rem 0;"><a href="/shop" style="color: var(--text-dim); text-decoration: none; transition: all 0.3s;" onmouseover="this.style.color='var(--primary)'" onmouseout="this.style.color='var(--text-dim)'">🛒 Do'kon</a></li>
+                        <li style="margin: 0.5rem 0;"><a href="/register" style="color: var(--text-dim); text-decoration: none; transition: all 0.3s;" onmouseover="this.style.color='var(--primary)'" onmouseout="this.style.color='var(--text-dim)'">📝 Ro'yxatdan o'tish</a></li>
+                        <li style="margin: 0.5rem 0;"><a href="/login" style="color: var(--text-dim); text-decoration: none; transition: all 0.3s;" onmouseover="this.style.color='var(--primary)'" onmouseout="this.style.color='var(--text-dim)'">🔐 Kirish</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h3>📱 Ijtimoiy tarmoqlar</h3>
+                    <p>Bizning ijtimoiy tarmoqlarda yangiliklar va aksiyalardan birinchi bo'lib xabardor bo'ling!</p>
+                    <div class="social-links">
+                        <a href="{settings.get('https://discord.com/invite/EbJ2cpkwuZ', '#')}" class="social-link discord" target="_blank" title="Discord"><i class="fab fa-discord"></i></a>
+                        <a href="{settings.get('https://instagram.elitemc.uz', '#')}" class="social-link instagram" target="_blank" title="Instagram"><i class="fab fa-instagram"></i></a>
+                        <a href="{settings.get('https://t.me/EliteMcChannel', '#')}" class="social-link telegram" target="_blank" title="Telegram"><i class="fab fa-telegram"></i></a>
+                        <a href="{settings.get('https://www.youtube.com/@SSmertnix', '#')}" class="social-link youtube" target="_blank" title="YouTube"><i class="fab fa-youtube"></i></a>
+                    </div>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>Made with ❤️ by EliteMC Team</p>
+                <p class="copyright">© 2026 EliteMC.uz - Barcha huquqlar himoyalangan</p>
             </div>
         </div>
     </footer>
-</body>
-</html>
-    """
-
-
-# ===================== LOGIN PAGE =====================
-@app.get("/login", response_class=HTMLResponse)
-async def login_page():
-    return """
-<!DOCTYPE html>
-<html lang="uz">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kirish - ThemcHost.uz</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            position: relative;
-            overflow: hidden;
-        }
-
-        body::before {
-            content: '';
-            position: absolute;
-            width: 600px;
-            height: 600px;
-            background: radial-gradient(circle, rgba(0, 255, 0, 0.1), transparent);
-            top: -300px;
-            left: -300px;
-            animation: pulse 4s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.2); }
-        }
-
-        .login-container {
-            background: rgba(26, 26, 26, 0.95);
-            backdrop-filter: blur(10px);
-            border: 2px solid rgba(0, 255, 0, 0.3);
-            border-radius: 20px;
-            padding: 50px 40px;
-            width: 100%;
-            max-width: 450px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-            position: relative;
-            z-index: 10;
-        }
-
-        .logo {
-            text-align: center;
-            font-size: 2.5em;
-            color: #00ff00;
-            margin-bottom: 10px;
-            font-weight: 700;
-        }
-
-        .subtitle {
-            text-align: center;
-            color: #888;
-            margin-bottom: 40px;
-            font-size: 1.1em;
-        }
-
-        .form-group {
-            margin-bottom: 25px;
-        }
-
-        .form-group label {
-            display: block;
-            color: #00ff00;
-            margin-bottom: 10px;
-            font-weight: 600;
-            font-size: 0.95em;
-        }
-
-        .form-group input {
-            width: 100%;
-            padding: 15px;
-            background: rgba(0, 0, 0, 0.5);
-            border: 2px solid rgba(0, 255, 0, 0.3);
-            border-radius: 10px;
-            color: #fff;
-            font-size: 1em;
-            transition: all 0.3s;
-        }
-
-        .form-group input:focus {
-            outline: none;
-            border-color: #00ff00;
-            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
-        }
-
-        .btn-login {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            border: none;
-            border-radius: 10px;
-            font-size: 1.1em;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 10px;
-        }
-
-        .btn-login:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
-        }
-
-        .divider {
-            text-align: center;
-            color: #666;
-            margin: 30px 0;
-            position: relative;
-        }
-
-        .divider::before,
-        .divider::after {
-            content: '';
-            position: absolute;
-            top: 50%;
-            width: 40%;
-            height: 1px;
-            background: rgba(255, 255, 255, 0.1);
-        }
-
-        .divider::before {
-            left: 0;
-        }
-
-        .divider::after {
-            right: 0;
-        }
-
-        .register-link {
-            text-align: center;
-            color: #888;
-            margin-top: 20px;
-        }
-
-        .register-link a {
-            color: #00ff00;
-            text-decoration: none;
-            font-weight: 600;
-            transition: all 0.3s;
-        }
-
-        .register-link a:hover {
-            color: #00cc00;
-        }
-
-        .back-home {
-            text-align: center;
-            margin-top: 20px;
-        }
-
-        .back-home a {
-            color: #666;
-            text-decoration: none;
-            transition: all 0.3s;
-        }
-
-        .back-home a:hover {
-            color: #00ff00;
-        }
-
-        .error-message {
-            background: rgba(255, 0, 0, 0.1);
-            border: 1px solid rgba(255, 0, 0, 0.3);
-            color: #ff4444;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            display: none;
-        }
-    </style>
-</head>
-<body>
-    <div class="login-container">
-        <div class="logo">⛏️ ThemcHost.uz</div>
-        <div class="subtitle">Hisobingizga kiring</div>
-
-        <div id="errorMessage" class="error-message"></div>
-
-        <form id="loginForm">
-            <div class="form-group">
-                <label>Email yoki Username</label>
-                <input type="text" name="username" required placeholder="username@example.com">
-            </div>
-
-            <div class="form-group">
-                <label>Parol</label>
-                <input type="password" name="password" required placeholder="••••••••">
-            </div>
-
-            <button type="submit" class="btn-login">Kirish</button>
-        </form>
-
-        <div class="divider">yoki</div>
-
-        <div class="register-link">
-            Hisobingiz yo'qmi? <a href="/register">Ro'yxatdan o'ting</a>
-        </div>
-
-        <div class="back-home">
-            <a href="/">← Bosh sahifaga qaytish</a>
-        </div>
-    </div>
-
     <script>
-        document.getElementById('loginForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-
-            try {
-                const response = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams(formData)
-                });
-
+        function showNotification(message, type = 'success') {{
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.innerHTML = `<i class="fas fa-${{type === 'success' ? 'check-circle' : 'exclamation-circle'}}"></i><span>${{message}}</span>`;
+            document.body.appendChild(notification);
+            setTimeout(() => {{
+                notification.style.animation = 'slideInRight 0.5s ease-out reverse';
+                setTimeout(() => notification.remove(), 500);
+            }}, 3000);
+        }}
+        async function handleFormSubmit(formId, url) {{
+            const form = document.getElementById(formId);
+            if (!form) return;
+            form.addEventListener('submit', async (e) => {{
+                e.preventDefault();
+                const formData = new FormData(form);
+                const data = Object.fromEntries(formData);
+                try {{
+                    const response = await fetch(url, {{
+                        method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)
+                    }});
+                    const result = await response.json();
+                    if (result.success) {{
+                        showNotification(result.message, 'success');
+                        if (result.redirect) setTimeout(() => window.location.href = result.redirect, 1500);
+                    }} else {{
+                        showNotification(result.message, 'error');
+                    }}
+                }} catch (error) {{
+                    showNotification('Xatolik yuz berdi!', 'error');
+                }}
+            }});
+        }}
+        handleFormSubmit('loginForm', '/login');
+        handleFormSubmit('registerForm', '/register');
+        document.querySelectorAll('input[type="file"]').forEach(input => {{
+            input.addEventListener('change', function(e) {{
+                const file = e.target.files[0];
+                if (file && file.type.startsWith('image/')) {{
+                    const reader = new FileReader();
+                    reader.onload = function(e) {{
+                        const preview = document.createElement('img');
+                        preview.src = e.target.result;
+                        preview.className = 'image-preview';
+                        const container = input.closest('.form-group');
+                        const existing = container.querySelector('.image-preview');
+                        if (existing) existing.remove();
+                        container.appendChild(preview);
+                    }};
+                    reader.readAsDataURL(file);
+                }}
+            }});
+        }});
+        async function approveDeposit(id) {{
+            const comment = prompt('Izoh kiriting (ixtiyoriy):');
+            try {{
+                const response = await fetch(`/admin/approve_deposit/${{id}}`, {{
+                    method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{comment}})
+                }});
                 const result = await response.json();
-
-                if (result.success) {
-                    window.location.href = '/dashboard';
-                } else {
-                    document.getElementById('errorMessage').style.display = 'block';
-                    document.getElementById('errorMessage').textContent = result.message;
-                }
-            } catch (error) {
-                document.getElementById('errorMessage').style.display = 'block';
-                document.getElementById('errorMessage').textContent = 'Xatolik yuz berdi!';
-            }
-        });
+                if (result.success) {{
+                    showNotification(result.message, 'success');
+                    setTimeout(() => location.reload(), 1500);
+                }}
+            }} catch (error) {{
+                showNotification('Xatolik yuz berdi!', 'error');
+            }}
+        }}
+        async function rejectDeposit(id) {{
+            const comment = prompt('Rad etish sababini kiriting:');
+            if (!comment) return;
+            try {{
+                const response = await fetch(`/admin/reject_deposit/${{id}}`, {{
+                    method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify({{comment}})
+                }});
+                const result = await response.json();
+                if (result.success) {{
+                    showNotification(result.message, 'success');
+                    setTimeout(() => location.reload(), 1500);
+                }}
+            }} catch (error) {{
+                showNotification('Xatolik yuz berdi!', 'error');
+            }}
+        }}
+        async function buyRank(packageId) {{
+            if (!confirm('Ushbu paketni sotib olishga ishonchingiz komilmi?')) return;
+            try {{
+                const response = await fetch(`/buy_rank/${{packageId}}`, {{
+                    method: 'POST', headers: {{'Content-Type': 'application/json'}}
+                }});
+                const result = await response.json();
+                if (result.success) {{
+                    showNotification(result.message, 'success');
+                    setTimeout(() => location.reload(), 2000);
+                }} else {{
+                    showNotification(result.message, 'error');
+                }}
+            }} catch (error) {{
+                showNotification('Xatolik yuz berdi!', 'error');
+            }}
+        }}
+        async function saveSettings() {{
+            const form = document.getElementById('settingsForm');
+            const formData = new FormData(form);
+            const data = Object.fromEntries(formData);
+            try {{
+                const response = await fetch('/admin/settings', {{
+                    method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)
+                }});
+                const result = await response.json();
+                if (result.success) showNotification(result.message, 'success');
+            }} catch (error) {{
+                showNotification('Xatolik yuz berdi!', 'error');
+            }}
+        }}
     </script>
 </body>
-</html>
-    """
+</html>'''
 
 
-# ===================== REGISTER PAGE =====================
-@app.get("/register", response_class=HTMLResponse)
-async def register_page():
-    return """
-<!DOCTYPE html>
-<html lang="uz">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Ro'yxatdan o'tish - ThemcHost.uz</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            position: relative;
-            overflow: hidden;
-            padding: 20px;
-        }
-
-        body::before {
-            content: '';
-            position: absolute;
-            width: 600px;
-            height: 600px;
-            background: radial-gradient(circle, rgba(0, 255, 0, 0.1), transparent);
-            bottom: -300px;
-            right: -300px;
-            animation: pulse 4s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { transform: scale(1); }
-            50% { transform: scale(1.2); }
-        }
-
-        .register-container {
-            background: rgba(26, 26, 26, 0.95);
-            backdrop-filter: blur(10px);
-            border: 2px solid rgba(0, 255, 0, 0.3);
-            border-radius: 20px;
-            padding: 50px 40px;
-            width: 100%;
-            max-width: 450px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
-            position: relative;
-            z-index: 10;
-        }
-
-        .logo {
-            text-align: center;
-            font-size: 2.5em;
-            color: #00ff00;
-            margin-bottom: 10px;
-            font-weight: 700;
-        }
-
-        .subtitle {
-            text-align: center;
-            color: #888;
-            margin-bottom: 40px;
-            font-size: 1.1em;
-        }
-
-        .form-group {
-            margin-bottom: 25px;
-        }
-
-        .form-group label {
-            display: block;
-            color: #00ff00;
-            margin-bottom: 10px;
-            font-weight: 600;
-            font-size: 0.95em;
-        }
-
-        .form-group input {
-            width: 100%;
-            padding: 15px;
-            background: rgba(0, 0, 0, 0.5);
-            border: 2px solid rgba(0, 255, 0, 0.3);
-            border-radius: 10px;
-            color: #fff;
-            font-size: 1em;
-            transition: all 0.3s;
-        }
-
-        .form-group input:focus {
-            outline: none;
-            border-color: #00ff00;
-            box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);
-        }
-
-        .btn-register {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            border: none;
-            border-radius: 10px;
-            font-size: 1.1em;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 10px;
-        }
-
-        .btn-register:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.5);
-        }
-
-        .divider {
-            text-align: center;
-            color: #666;
-            margin: 30px 0;
-            position: relative;
-        }
-
-        .divider::before,
-        .divider::after {
-            content: '';
-            position: absolute;
-            top: 50%;
-            width: 40%;
-            height: 1px;
-            background: rgba(255, 255, 255, 0.1);
-        }
-
-        .divider::before {
-            left: 0;
-        }
-
-        .divider::after {
-            right: 0;
-        }
-
-        .login-link {
-            text-align: center;
-            color: #888;
-            margin-top: 20px;
-        }
-
-        .login-link a {
-            color: #00ff00;
-            text-decoration: none;
-            font-weight: 600;
-            transition: all 0.3s;
-        }
-
-        .login-link a:hover {
-            color: #00cc00;
-        }
-
-        .back-home {
-            text-align: center;
-            margin-top: 20px;
-        }
-
-        .back-home a {
-            color: #666;
-            text-decoration: none;
-            transition: all 0.3s;
-        }
-
-        .back-home a:hover {
-            color: #00ff00;
-        }
-
-        .error-message, .success-message {
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            display: none;
-        }
-
-        .error-message {
-            background: rgba(255, 0, 0, 0.1);
-            border: 1px solid rgba(255, 0, 0, 0.3);
-            color: #ff4444;
-        }
-
-        .success-message {
-            background: rgba(0, 255, 0, 0.1);
-            border: 1px solid rgba(0, 255, 0, 0.3);
-            color: #00ff00;
-        }
-    </style>
-</head>
-<body>
-    <div class="register-container">
-        <div class="logo">⛏️ ThemcHost.uz</div>
-        <div class="subtitle">Yangi hisob yarating</div>
-
-        <div id="errorMessage" class="error-message"></div>
-        <div id="successMessage" class="success-message"></div>
-
-        <form id="registerForm">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" required placeholder="username" minlength="3">
-            </div>
-
-            <div class="form-group">
-                <label>Email</label>
-                <input type="email" name="email" required placeholder="email@example.com">
-            </div>
-
-            <div class="form-group">
-                <label>Parol</label>
-                <input type="password" name="password" required placeholder="••••••••" minlength="6">
-            </div>
-
-            <div class="form-group">
-                <label>Parolni tasdiqlang</label>
-                <input type="password" name="confirm_password" required placeholder="••••••••" minlength="6">
-            </div>
-
-            <button type="submit" class="btn-register">Ro'yxatdan o'tish</button>
-        </form>
-
-        <div class="divider">yoki</div>
-
-        <div class="login-link">
-            Hisobingiz bormi? <a href="/login">Kirish</a>
-        </div>
-
-        <div class="back-home">
-            <a href="/">← Bosh sahifaga qaytish</a>
-        </div>
-    </div>
-
-    <script>
-        document.getElementById('registerForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-
-            if (formData.get('password') !== formData.get('confirm_password')) {
-                document.getElementById('errorMessage').style.display = 'block';
-                document.getElementById('errorMessage').textContent = 'Parollar mos kelmadi!';
-                return;
-            }
-
-            try {
-                const response = await fetch('/api/register', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams(formData)
-                });
-
-                const result = await response.json();
-
-                if (result.success) {
-                    document.getElementById('successMessage').style.display = 'block';
-                    document.getElementById('successMessage').textContent = 'Muvaffaqiyatli! Kirish sahifasiga yo\\'naltirilmoqda...';
-                    setTimeout(() => {
-                        window.location.href = '/login';
-                    }, 2000);
-                } else {
-                    document.getElementById('errorMessage').style.display = 'block';
-                    document.getElementById('errorMessage').textContent = result.message;
-                }
-            } catch (error) {
-                document.getElementById('errorMessage').style.display = 'block';
-                document.getElementById('errorMessage').textContent = 'Xatolik yuz berdi!';
-            }
-        });
-    </script>
-</body>
-</html>
-    """
-
-
-# ===================== API: LOGIN =====================
-@app.post("/api/login")
-async def api_login(username: str = Form(...), password: str = Form(...)):
-    conn = sqlite3.connect('hosting.db')
+@app.route('/')
+def index():
+    conn = sqlite3.connect('elitemc.db')
     c = conn.cursor()
-
-    hashed_pw = hash_password(password)
-    c.execute('SELECT * FROM users WHERE (username = ? OR email = ?) AND password = ?',
-              (username, username, hashed_pw))
-    user = c.fetchone()
-
-    if not user:
-        conn.close()
-        return JSONResponse({"success": False, "message": "Username yoki parol noto'g'ri!"})
-
-    session_token = secrets.token_urlsafe(32)
-    c.execute('INSERT INTO sessions (user_id, session_token, created_at) VALUES (?, ?, ?)',
-              (user[0], session_token, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    conn.commit()
+    packages = c.execute('SELECT * FROM packages WHERE is_active = 1').fetchall()
+    total_users = c.execute('SELECT COUNT(*) FROM users WHERE is_admin = 0').fetchone()[0]
+    total_purchases = c.execute('SELECT COUNT(*) FROM purchases').fetchone()[0]
+    total_revenue = c.execute('SELECT SUM(amount) FROM purchases').fetchone()[0] or 0
     conn.close()
+    content = f'''
+    <div class="hero">
+        <div class="container">
+            <h1>🎮 EliteMC.uz</h1>
+            <p>O'zbekistonning eng yaxshi Minecraft serveri!</p>
+            <div class="server-ip" onclick="navigator.clipboard.writeText('play.elitemc.uz'); showNotification('Server IP nusxalandi! ✅')">play.elitemc.uz</div>
+            <br><br>
+            <a href="/shop" class="btn btn-primary" style="margin-top: 2rem;">🛒 Do'konga o'tish</a>
+        </div>
+    </div>
+    <div class="container">
+        <div class="stats">
+            <div class="stat-card"><i class="fas fa-users"></i><h3>{total_users}</h3><p>Ro'yxatdan o'tgan foydalanuvchilar</p></div>
+            <div class="stat-card"><i class="fas fa-shopping-bag"></i><h3>{total_purchases}</h3><p>Amalga oshirilgan xaridlar</p></div>
+            <div class="stat-card"><i class="fas fa-coins"></i><h3>{total_revenue:,.0f} so'm</h3><p>Jami daromad</p></div>
+        </div>
+        <div class="section-title"><h2>🎁 Mavjud Paketlar</h2></div>
+        <div class="packages">'''
+    for pkg in packages:
+        features = pkg[5].split(',')
+        features_html = ''.join([f'<li><i class="fas fa-check-circle"></i> {f.strip()}</li>' for f in features])
+        content += f'''<div class="package-card"><div class="package-name" style="color: {pkg[6]}">{pkg[1]}</div>
+            <div class="package-price">{pkg[3]:,.0f} so'm</div><div class="package-desc">{pkg[2]}</div>
+            <ul class="package-features">{features_html}</ul><div class="package-duration"><i class="fas fa-clock"></i> Muddat: {pkg[4]} kun</div>
+            <a href="/shop" class="btn btn-primary btn-full">Sotib olish</a></div>'''
+    content += '</div></div>'
+    return render_page(content, logged_in='user_id' in session, is_admin=session.get('is_admin', False))
 
-    response = JSONResponse({"success": True, "message": "Muvaffaqiyatli!"})
-    response.set_cookie(key="session_token", value=session_token, httponly=True, max_age=86400 * 30)
-    return response
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        data = request.json
+        username, email = data.get('username'), data.get('email')
+        password = hashlib.sha256(data.get('password').encode()).hexdigest()
+        minecraft_nick = data.get('minecraft_nick')
+        try:
+            conn = sqlite3.connect('elitemc.db')
+            c = conn.cursor()
+            c.execute('INSERT INTO users (username, email, password, minecraft_nick) VALUES (?, ?, ?, ?)',
+                      (username, email, password, minecraft_nick))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': "Ro'yxatdan muvaffaqiyatli o'tdingiz!", 'redirect': '/login'})
+        except sqlite3.IntegrityError:
+            return jsonify({'success': False, 'message': 'Bu foydalanuvchi nomi yoki email allaqachon mavjud!'})
+    content = '''<div class="container" style="max-width: 500px; margin-top: 5rem; margin-bottom: 5rem;">
+        <div class="card"><div class="card-header"><h2>📝 Ro'yxatdan o'tish</h2></div>
+            <form id="registerForm">
+                <div class="form-group"><label><i class="fas fa-user"></i> Foydalanuvchi nomi</label>
+                    <input type="text" name="username" required placeholder="Ismingiz..."></div>
+                <div class="form-group"><label><i class="fas fa-envelope"></i> Email</label>
+                    <input type="email" name="email" required placeholder="example@mail.com"></div>
+                <div class="form-group"><label><i class="fas fa-lock"></i> Parol</label>
+                    <input type="password" name="password" required placeholder="••••••••"></div>
+                <div class="form-group"><label><i class="fas fa-gamepad"></i> Minecraft nick</label>
+                    <input type="text" name="minecraft_nick" required placeholder="Steve"></div>
+                <button type="submit" class="btn btn-primary btn-full">Ro'yxatdan o'tish</button>
+            </form>
+            <p style="text-align: center; margin-top: 2rem; color: var(--text-dim);">Akkountingiz bormi? 
+                <a href="/login" style="color: var(--primary); text-decoration: none;">Kirish</a></p>
+        </div></div>'''
+    return render_page(content, logged_in=False)
 
 
-## ===================== API: REGISTER =====================
-@app.post("/api/register")
-async def api_register(
-        username: str = Form(...),
-        email: str = Form(...),
-        password: str = Form(...),
-        confirm_password: str = Form(...)
-):
-    # Parollarni tekshirish
-    if password != confirm_password:
-        return JSONResponse({"success": False, "message": "Parollar mos kelmadi!"})
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        data = request.json
+        username = data.get('username')
+        password = hashlib.sha256(data.get('password').encode()).hexdigest()
+        conn = sqlite3.connect('elitemc.db')
+        c = conn.cursor()
+        user = c.execute('SELECT * FROM users WHERE username = ? AND password = ?', (username, password)).fetchone()
+        conn.close()
+        if user:
+            session['user_id'], session['username'], session['is_admin'] = user[0], user[1], user[6]
+            return jsonify({'success': True, 'message': 'Xush kelibsiz!', 'redirect': '/profile', 'is_admin': user[6]})
+        return jsonify({'success': False, 'message': "Login yoki parol noto'g'ri!"})
+    content = '''<div class="container" style="max-width: 500px; margin-top: 5rem; margin-bottom: 5rem;">
+        <div class="card"><div class="card-header"><h2>🔐 Kirish</h2></div>
+            <form id="loginForm">
+                <div class="form-group"><label><i class="fas fa-user"></i> Foydalanuvchi nomi</label>
+                    <input type="text" name="username" required placeholder="Ismingiz..."></div>
+                <div class="form-group"><label><i class="fas fa-lock"></i> Parol</label>
+                    <input type="password" name="password" required placeholder="••••••••"></div>
+                <button type="submit" class="btn btn-primary btn-full">Kirish</button>
+            </form>
+            <p style="text-align: center; margin-top: 2rem; color: var(--text-dim);">Akkountingiz yo'qmi? 
+                <a href="/register" style="color: var(--primary); text-decoration: none;">Ro'yxatdan o'tish</a></p>
+        </div></div>'''
+    return render_page(content, logged_in=False)
 
-    conn = sqlite3.connect('hosting.db')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('index'))
+
+@app.route('/support', methods=['GET', 'POST'])
+@login_required
+def support():
+    conn = sqlite3.connect('elitemc.db')
     c = conn.cursor()
-    try:
-        # Bandligini tekshirish
-        c.execute('SELECT id FROM users WHERE username = ? OR email = ?', (username, email))
-        if c.fetchone():
-            return JSONResponse({"success": False, "message": "Username yoki Email band!"})
 
-        hashed_pw = hash_password(password)
-        created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # Ma'lumotni bazaga yozish
-        c.execute('''INSERT INTO users (username, email, password, balance, created_at)
-                     VALUES (?, ?, ?, ?, ?)''', (username, email, hashed_pw, 0.0, created_at))
+    if request.method == 'POST':
+        subject = request.form['subject']
+        c.execute("INSERT INTO support_tickets (user_id, subject) VALUES (?, ?)",
+                  (session['user_id'], subject))
         conn.commit()
-        return JSONResponse({"success": True, "message": "Ro'yxatdan o'tdingiz!"})
-    except Exception as e:
-        return JSONResponse({"success": False, "message": f"Xatolik: {str(e)}"})
-    finally:
-        conn.close()
 
-# ===================== DASHBOARD =====================
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(session_token: Optional[str] = Cookie(None)):
-    user_id = verify_session(session_token)
-    if not user_id:
-        return RedirectResponse(url="/login")
+    tickets = c.execute("SELECT * FROM support_tickets WHERE user_id = ? ORDER BY created_at DESC",
+                        (session['user_id'],)).fetchall()
 
-    user = get_user_by_id(user_id)
-    if not user:
-        return RedirectResponse(url="/login")
-
-    conn = sqlite3.connect('hosting.db')
-    c = conn.cursor()
-    c.execute('SELECT * FROM servers WHERE user_id = ?', (user_id,))
-    servers = c.fetchall()
-    c.execute('SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 10', (user_id,))
-    transactions = c.fetchall()
     conn.close()
 
-    servers_html = ""
-    for srv in servers:
-        servers_html += f"""
-        <div class="server-card">
-            <div class="server-header">
-                <div class="server-icon">⛏️</div>
-                <div class="server-info">
-                    <div class="server-name">{srv[2]}</div>
-                    <div class="server-domain">{srv[3]}</div>
-                </div>
-                <div class="server-status {'active' if srv[9] == 'active' else 'inactive'}">{srv[9].upper()}</div>
-            </div>
-            <div class="server-specs">
-                <div class="spec-item">
-                    <div class="spec-label">RAM</div>
-                    <div class="spec-value">{srv[5]}MB</div>
-                </div>
-                <div class="spec-item">
-                    <div class="spec-label">CPU</div>
-                    <div class="spec-value">{srv[6]}%</div>
-                </div>
-                <div class="spec-item">
-                    <div class="spec-label">DISK</div>
-                    <div class="spec-value">{srv[7]}MB</div>
-                </div>
-                <div class="spec-item">
-                    <div class="spec-label">PLAN</div>
-                    <div class="spec-value">{srv[4].upper()}</div>
-                </div>
-            </div>
-            <div class="server-actions">
-                <button class="btn-action" onclick="window.open('{PTERODACTYL_URL}/server/{srv[8]}', '_blank')">
-                    🎮 Panel
-                </button>
-                <button class="btn-action danger" onclick="deleteServer('{srv[8]}')">
-                    🗑️ O'chirish
-                </button>
-            </div>
-        </div>
-        """
-
-    if not servers_html:
-        servers_html = """
-        <div style="text-align: center; padding: 60px 20px; color: #666;">
-            <div style="font-size: 4em; margin-bottom: 20px;">📦</div>
-            <h3 style="color: #888; margin-bottom: 10px;">Serverlar yo'q</h3>
-            <p>Birinchi serveringizni yarating!</p>
-        </div>
-        """
-
-    transactions_html = ""
-    for tx in transactions:
-        tx_type = "+" if tx[3] == "deposit" else "-"
-        tx_color = "#00ff00" if tx[3] == "deposit" else "#ff4444"
-        transactions_html += f"""
-        <tr>
-            <td>{tx[5]}</td>
-            <td>{tx[4]}</td>
-            <td style="color: {tx_color}; font-weight: 600;">{tx_type}{tx[2]:,.0f} UZS</td>
-            <td><span class="badge">{tx[3]}</span></td>
-        </tr>
-        """
-
-    if not transactions_html:
-        transactions_html = """
-        <tr>
-            <td colspan="4" style="text-align: center; color: #666; padding: 30px;">
-                Tranzaksiyalar yo'q
-            </td>
-        </tr>
-        """
-
-    return f"""
-<!DOCTYPE html>
-<html lang="uz">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - ThemcHost.uz</title>
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-
-        body {{
-            font-family: 'Inter', sans-serif;
-            background: #0a0a0a;
-            color: #fff;
-        }}
-
-        /* Sidebar */
-        .sidebar {{
-            position: fixed;
-            left: 0;
-            top: 0;
-            width: 280px;
-            height: 100vh;
-            background: #111;
-            border-right: 1px solid rgba(0, 255, 0, 0.2);
-            padding: 30px 20px;
-            overflow-y: auto;
-        }}
-
-        .logo {{
-            font-size: 1.8em;
-            color: #00ff00;
-            margin-bottom: 50px;
-            font-weight: 700;
-            text-align: center;
-        }}
-
-        .menu-item {{
-            padding: 15px 20px;
-            margin-bottom: 10px;
-            border-radius: 10px;
-            cursor: pointer;
-            transition: all 0.3s;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            color: #888;
-            text-decoration: none;
-        }}
-
-        .menu-item:hover, .menu-item.active {{
-            background: rgba(0, 255, 0, 0.1);
-            color: #00ff00;
-        }}
-
-        .menu-icon {{
-            font-size: 1.3em;
-        }}
-
-        .user-info {{
-            margin-top: auto;
-            padding-top: 30px;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-        }}
-
-        .user-name {{
-            color: #00ff00;
-            font-weight: 600;
-            margin-bottom: 10px;
-        }}
-
-        .user-balance {{
-            color: #888;
-            font-size: 0.9em;
-        }}
-
-        .btn-logout {{
-            width: 100%;
-            padding: 12px;
-            background: rgba(255, 0, 0, 0.1);
-            border: 1px solid rgba(255, 0, 0, 0.3);
-            color: #ff4444;
-            border-radius: 8px;
-            cursor: pointer;
-            margin-top: 15px;
-            font-weight: 600;
-            transition: all 0.3s;
-        }}
-
-        .btn-logout:hover {{
-            background: rgba(255, 0, 0, 0.2);
-        }}
-
-        /* Main Content */
-        .main-content {{
-            margin-left: 280px;
-            padding: 30px;
-        }}
-
-        .header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 40px;
-        }}
-
-        .page-title {{
-            font-size: 2.5em;
-            color: #00ff00;
-            font-weight: 700;
-        }}
-
-        /* Stats Cards */
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 25px;
-            margin-bottom: 40px;
-        }}
-
-        .stat-card {{
-            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
-            border: 1px solid rgba(0, 255, 0, 0.3);
-            border-radius: 15px;
-            padding: 25px;
-            transition: all 0.3s;
-        }}
-
-        .stat-card:hover {{
-            transform: translateY(-5px);
-            border-color: #00ff00;
-            box-shadow: 0 10px 30px rgba(0, 255, 0, 0.2);
-        }}
-
-        .stat-icon {{
-            font-size: 2.5em;
-            margin-bottom: 15px;
-        }}
-
-        .stat-label {{
-            color: #888;
-            font-size: 0.95em;
-            margin-bottom: 8px;
-        }}
-
-        .stat-value {{
-            font-size: 2em;
-            color: #00ff00;
-            font-weight: 700;
-        }}
-
-        /* Section */
-        .section {{
-            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
-            border: 1px solid rgba(0, 255, 0, 0.3);
-            border-radius: 15px;
-            padding: 30px;
-            margin-bottom: 30px;
-        }}
-
-        .section-header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 25px;
-        }}
-
-        .section-title {{
-            font-size: 1.8em;
-            color: #00ff00;
-            font-weight: 700;
-        }}
-
-        .btn-primary {{
-            background: linear-gradient(135deg, #00ff00, #00cc00);
-            color: #000;
-            padding: 12px 30px;
-            border: none;
-            border-radius: 10px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s;
-        }}
-
-        .btn-primary:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 8px 25px rgba(0, 255, 0, 0.5);
-        }}
-
-        /* Servers */
-        .servers-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-            gap: 25px;
-        }}
-
-        .server-card {{
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid rgba(0, 255, 0, 0.2);
-            border-radius: 12px;
-            padding: 20px;
-            transition: all 0.3s;
-        }}
-
-        .server-card:hover {{
-            border-color: #00ff00;
-            box-shadow: 0 8px 25px rgba(0, 255, 0, 0.2);
-        }}
-
-        .server-header {{
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            margin-bottom: 20px;
-            padding-bottom: 15px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }}
-
-        .server-icon {{
-            font-size: 2.5em;
-        }}
-
-        .server-info {{
-            flex: 1;
-        }}
-
-        .server-name {{
-            font-size: 1.3em;
-            color: #00ff00;
-            font-weight: 700;
-            margin-bottom: 5px;
-        }}
-
-        .server-domain {{
-            color: #888;
-            font-size: 0.9em;
-        }}
-
-        .server-status {{
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-size: 0.8em;
-            font-weight: 700;
-        }}
-
-        .server-status.active {{
-            background: rgba(0, 255, 0, 0.2);
-            color: #00ff00;
-        }}
-
-        .server-status.inactive {{
-            background: rgba(255, 0, 0, 0.2);
-            color: #ff4444;
-        }}
-
-        .server-specs {{
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 15px;
-            margin-bottom: 20px;
-        }}
-
-        .spec-item {{
-            background: rgba(0, 0, 0, 0.3);
-            padding: 12px;
-            border-radius: 8px;
-            text-align: center;
-        }}
-
-        .spec-label {{
-            color: #666;
-            font-size: 0.85em;
-            margin-bottom: 5px;
-        }}
-
-        .spec-value {{
-            color: #00ff00;
-            font-size: 1.2em;
-            font-weight: 700;
-        }}
-
-        .server-actions {{
-            display: flex;
-            gap: 10px;
-        }}
-
-        .btn-action {{
-            flex: 1;
-            padding: 12px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            transition: all 0.3s;
-            background: rgba(0, 255, 0, 0.1);
-            color: #00ff00;
-            border: 1px solid rgba(0, 255, 0, 0.3);
-        }}
-
-        .btn-action:hover {{
-            background: rgba(0, 255, 0, 0.2);
-            transform: translateY(-2px);
-        }}
-
-        .btn-action.danger {{
-            background: rgba(255, 0, 0, 0.1);
-            color: #ff4444;
-            border-color: rgba(255, 0, 0, 0.3);
-        }}
-
-        .btn-action.danger:hover {{
-            background: rgba(255, 0, 0, 0.2);
-        }}
-
-        /* Table */
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-        }}
-
-        th, td {{
-            padding: 15px;
-            text-align: left;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }}
-
-        th {{
-            color: #00ff00;
-            font-weight: 700;
-            background: rgba(0, 0, 0, 0.3);
-        }}
-
-        td {{
-            color: #ccc;
-        }}
-
-        .badge {{
-            padding: 4px 10px;
-            border-radius: 15px;
-            background: rgba(0, 255, 0, 0.2);
-            color: #00ff00;
-            font-size: 0.85em;
-            font-weight: 600;
-        }}
-
-        /* Modal */
-        .modal {{
-            display: none;
-            position: fixed;
-            z-index: 2000;
-            left: 0;
-            top: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.9);
-            overflow-y: auto;
-        }}
-
-        .modal-content {{
-            background: linear-gradient(135deg, #1a1a1a, #0d0d0d);
-            margin: 50px auto;
-            padding: 40px;
-            border: 2px solid #00ff00;
-            border-radius: 15px;
-            width: 90%;
-            max-width: 600px;
-            box-shadow: 0 10px 50px rgba(0, 255, 0, 0.3);
-        }}
-
-        .close {{
-            color: #00ff00;
-            float: right;
-            font-size: 35px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-        }}
-
-        .close:hover {{
-            color: #00cc00;
-            transform: rotate(90deg);
-        }}
-
-        .form-group {{
-            margin-bottom: 25px;
-        }}
-
-        .form-group label {{
-            display: block;
-            color: #00ff00;
-            margin-bottom: 8px;
-            font-weight: 600;
-        }}
-
-        .form-group input,
-        .form-group select {{
-            width: 100%;
-            padding: 12px;
-            background: rgba(0, 0, 0, 0.5);
-            border: 2px solid rgba(0, 255, 0, 0.3);
-            border-radius: 8px;
-            color: #fff;
-            font-size: 1em;
-            transition: all 0.3s;
-        }}
-
-        .form-group input:focus,
-        .form-group select:focus {{
-            outline: none;
-            border-color: #00ff00;
-            box-shadow: 0 0 15px rgba(0, 255, 0, 0.3);
-        }}
-
-        /* Responsive */
-        @media (max-width: 768px) {{
-            .sidebar {{
-                width: 100%;
-                height: auto;
-                position: relative;
-            }}
-            .main-content {{
-                margin-left: 0;
-            }}
-            .servers-grid {{
-                grid-template-columns: 1fr;
-            }}
-        }}
-    </style>
-</head>
-<body>
-    <div class="sidebar">
-        <div class="logo">⛏️ ThemcHost.uz</div>
-
-        <div class="menu-item active">
-            <span class="menu-icon">🏠</span>
-            <span>Dashboard</span>
-        </div>
-        <div class="menu-item" onclick="document.getElementById('createModal').style.display='block'">
-            <span class="menu-icon">➕</span>
-            <span>Server Yaratish</span>
-        </div>
-        <div class="menu-item">
-            <span class="menu-icon">💰</span>
-            <span>Balansni To'ldirish</span>
-        </div>
-        <div class="menu-item">
-            <span class="menu-icon">📊</span>
-            <span>Tranzaksiyalar</span>
-        </div>
-        <div class="menu-item">
-            <span class="menu-icon">⚙️</span>
-            <span>Sozlamalar</span>
-        </div>
-
-        <div class="user-info">
-            <div class="user-name">👤 {user[1]}</div>
-            <div class="user-balance">💵 Balans: {user[4]:,.0f} UZS</div>
-            <button class="btn-logout" onclick="logout()">🚪 Chiqish</button>
-        </div>
-    </div>
-
-    <div class="main-content">
-        <div class="header">
-            <h1 class="page-title">Dashboard</h1>
-        </div>
-
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-icon">🖥️</div>
-                <div class="stat-label">Serverlar</div>
-                <div class="stat-value">{len(servers)}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">💰</div>
-                <div class="stat-label">Balans</div>
-                <div class="stat-value">{user[4]:,.0f}</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">📊</div>
-                <div class="stat-label">Umumiy Xarajat</div>
-                <div class="stat-value">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-icon">⚡</div>
-                <div class="stat-label">Faol Serverlar</div>
-                <div class="stat-value">{sum(1 for s in servers if s[9] == 'active')}</div>
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-header">
-                <h2 class="section-title">Mening Serverlarim</h2>
-                <button class="btn-primary" onclick="document.getElementById('createModal').style.display='block'">
-                    ➕ Yangi Server
-                </button>
-            </div>
-            <div class="servers-grid">
-                {servers_html}
-            </div>
-        </div>
-
-        <div class="section">
-            <div class="section-header">
-                <h2 class="section-title">So'nggi Tranzaksiyalar</h2>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Sana</th>
-                        <th>Tavsif</th>
-                        <th>Summa</th>
-                        <th>Turi</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {transactions_html}
-                </tbody>
-            </table>
-        </div>
-    </div>
-
-    <!-- Create Server Modal -->
-    <div id="createModal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="document.getElementById('createModal').style.display='none'">&times;</span>
-            <h2 style="color: #00ff00; margin-bottom: 30px;">Yangi Server Yaratish</h2>
-            <form id="createForm">
+    content = '''
+    <div class="container">
+        <div class="section-title"><h2>💬 SUPPORT CHAT</h2></div>
+
+        <div class="card">
+            <form method="POST">
                 <div class="form-group">
-                    <label>Server Nomi</label>
-                    <input type="text" name="server_name" required placeholder="MyAwesomeServer">
+                    <label>📩 Yangi murojaat</label>
+                    <input type="text" name="subject" placeholder="Muammoingiz..." required>
                 </div>
-                <div class="form-group">
-                    <label>Subdomain</label>
-                    <input type="text" name="domain" required placeholder="myserver" pattern="[a-z0-9-]+" title="Faqat kichik harflar, raqamlar va - belgisi">
-                    <small style="color: #666;">*.themchost.uz</small>
-                </div>
-                <div class="form-group">
-                    <label>Tarif</label>
-                    <select name="plan" required id="planSelect" onchange="updatePrice()">
-                        <option value="proxy">🔷 PROXY - 5,000 UZS/oy (2GB RAM, 70% CPU)</option>
-                        <option value="rare">🔷 RARE - 20,000 UZS/oy (4GB RAM, 100% CPU)</option>
-                        <option value="pro">🔷 PRO - 45,000 UZS/oy (8GB RAM, 200% CPU)</option>
-                        <option value="boost">🔷 BOOST - 70,000 UZS/oy (12GB RAM, 300% CPU)</option>
-                        <option value="boost_plus">🔷 BOOST+ - 120,000 UZS/oy (16GB RAM, 300% CPU)</option>
-                        <option value="forest">✨ FOREST - 150,000 UZS/oy (20GB RAM, 400% CPU)</option>
-                        <option value="forest_plus">✨ FOREST+ - 195,000 UZS/oy (24GB RAM, 500% CPU)</option>
-                        <option value="vulcan">🔺 VULCAN - 260,000 UZS/oy (32GB RAM, 700% CPU)</option>
-                    </select>
-                </div>
-                <div style="background: rgba(0, 255, 0, 0.1); padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid rgba(0, 255, 0, 0.3);">
-                    <div style="color: #00ff00; font-weight: 600;">Sizning balansingiz: {user[4]:,.0f} UZS</div>
-                    <div style="color: #888; margin-top: 5px;" id="priceInfo">Narx: 5,000 UZS/oy</div>
-                </div>
-                <button type="submit" class="btn-primary" style="width: 100%; padding: 15px; font-size: 1.1em;">
-                    🚀 Server Yaratish
-                </button>
+                <button class="btn btn-primary btn-full">➕ Ticket ochish</button>
             </form>
         </div>
+
+        <div class="card">
+            <h3>🧾 Mening ticketlarim</h3>
+            <ul style="list-style:none;">
+    '''
+
+    for t in tickets:
+        status = "🟢 Ochiq" if t[3] == "open" else "🔴 Yopilgan"
+        content += f'''
+        <li style="padding:15px;border-bottom:1px solid rgba(255,255,255,.1)">
+            <a href="/support/{t[0]}" style="color:#00ff88;font-weight:700;">
+                #{t[0]} — {t[2]}
+            </a>
+            <span style="float:right">{status}</span>
+        </li>
+        '''
+
+    content += '</ul></div></div>'
+    return render_page(content, logged_in=True, is_admin=session.get('is_admin'))
+
+@app.route('/support/<int:ticket_id>', methods=['GET', 'POST'])
+@login_required
+def support_chat(ticket_id):
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+
+    if request.method == 'POST':
+        msg = request.form['message']
+        c.execute("INSERT INTO support_messages (ticket_id, user_id, message) VALUES (?, ?, ?)",
+                  (ticket_id, session['user_id'], msg))
+        conn.commit()
+
+    messages = c.execute("""
+        SELECT message, is_admin_reply, created_at 
+        FROM support_messages WHERE ticket_id = ?
+        ORDER BY created_at ASC
+    """, (ticket_id,)).fetchall()
+
+    conn.close()
+
+    chat = '''
+    <div class="container">
+        <div class="section-title"><h2>💬 Support Chat</h2></div>
+
+        <div class="card" style="max-height:500px;overflow:auto;">
+    '''
+
+    for msg in messages:
+        align = "right" if msg[1] else "left"
+        color = "#ff0099" if msg[1] else "#00ff88"
+
+        chat += f'''
+        <div style="text-align:{align};margin:12px;">
+            <span style="display:inline-block;padding:12px 18px;border-radius:15px;background:{color};color:black;font-weight:700;">
+                {msg[0]}
+            </span>
+        </div>
+        '''
+
+    chat += '''
+        </div>
+
+        <form method="POST" class="card">
+            <div class="form-group">
+                <input type="text" name="message" placeholder="Xabar yozing..." required>
+            </div>
+            <button class="btn btn-primary btn-full">📤 Yuborish</button>
+        </form>
     </div>
+    '''
 
-    <script>
-        const plans = {{
-            proxy: 5000,
-            rare: 20000,
-            pro: 45000,
-            boost: 70000,
-            boost_plus: 120000,
-            forest: 150000,
-            forest_plus: 195000,
-            vulcan: 260000
-        }};
+    return render_page(chat, logged_in=True)
 
-        function updatePrice() {{
-            const plan = document.getElementById('planSelect').value;
-            const price = plans[plan];
-            document.getElementById('priceInfo').textContent = `Narx: ${{price.toLocaleString()}} UZS/oy`;
-        }}
-
-        document.getElementById('createForm').addEventListener('submit', async (e) => {{
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            const plan = formData.get('plan');
-            const balance = {user[4]};
-
-            if (balance < plans[plan]) {{
-                alert('❌ Balans yetarli emas! Iltimos, balansni to\\'ldiring.');
-                return;
-            }}
-
-            try {{
-                const response = await fetch('/api/create-server', {{
-                    method: 'POST',
-                    body: formData
-                }});
-
-                const result = await response.json();
-
-                if (result.success) {{
-                    alert('✅ Server muvaffaqiyatli yaratildi!\\n\\nPanel: ' + result.panel_url);
-                    location.reload();
-                }} else {{
-                    alert('❌ Xatolik: ' + result.message);
-                }}
-            }} catch (error) {{
-                alert('❌ Server yaratishda xatolik!');
-            }}
-        }});
-
-        async function deleteServer(serverId) {{
-            if (!confirm('Serverni o\\'chirishni xohlaysizmi?')) return;
-
-            try {{
-                const response = await fetch(`/api/server/${{serverId}}`, {{
-                    method: 'DELETE'
-                }});
-
-                const result = await response.json();
-
-                if (result.success) {{
-                    alert('✅ Server o\\'chirildi!');
-                    location.reload();
-                }} else {{
-                    alert('❌ Xatolik: ' + result.message);
-                }}
-            }} catch (error) {{
-                alert('❌ Server o\\'chirishda xatolik!');
-            }}
-        }}
-
-        async function logout() {{
-            if (confirm('Chiqishni xohlaysizmi?')) {{
-                await fetch('/api/logout', {{ method: 'POST' }});
-                window.location.href = '/';
-            }}
-        }}
-
-        window.onclick = function(event) {{
-            const modal = document.getElementById('createModal');
-            if (event.target == modal) {{
-                modal.style.display = 'none';
-            }}
-        }}
-    </script>
-</body>
-</html>
-    """
-
-
-# ===================== API: CREATE SERVER =====================
-@app.post("/api/create-server")
-async def api_create_server(
-        session_token: Optional[str] = Cookie(None),
-        server_name: str = Form(...),
-        domain: str = Form(...),
-        plan: str = Form(...)
-):
-    user_id = verify_session(session_token)
-    if not user_id:
-        return JSONResponse({"success": False, "message": "Tizimga kiring!"})
-
-    user = get_user_by_id(user_id)
-    plan_info = PLANS.get(plan)
-
-    if not plan_info:
-        return JSONResponse({"success": False, "message": "Tarif topilmadi!"})
-
-    if user[4] < plan_info['price']:
-        return JSONResponse({"success": False, "message": "Balans yetarli emas!"})
-
-    pterodactyl_id = create_pterodactyl_server(server_name, plan, user[2])
-
-    conn = sqlite3.connect('hosting.db')
+@app.route('/admin/support')
+@admin_required
+def admin_support():
+    conn = sqlite3.connect('elitemc.db')
     c = conn.cursor()
 
-    c.execute('''INSERT INTO servers
-                 (user_id, server_name, domain, plan, ram, cpu, disk, pterodactyl_id, status, created_at, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (user_id, server_name, f"{domain}.themchost.uz", plan,
-               plan_info['ram'], plan_info['cpu'], plan_info['disk'],
-               pterodactyl_id, 'active',
-               datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-               (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')))
+    tickets = c.execute("""
+        SELECT support_tickets.id, users.username, subject, status 
+        FROM support_tickets 
+        JOIN users ON users.id = support_tickets.user_id
+        ORDER BY created_at DESC
+    """).fetchall()
 
-    new_balance = user[4] - plan_info['price']
-    c.execute('UPDATE users SET balance = ? WHERE id = ?', (new_balance, user_id))
-
-    c.execute('''INSERT INTO transactions
-                     (user_id, amount, type, description, created_at)
-                 VALUES (?, ?, ?, ?, ?)''',
-              (user_id, plan_info['price'], 'purchase',
-               f"Server yaratish: {server_name}",
-               datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-
-    conn.commit()
     conn.close()
 
-    return JSONResponse({
-        "success": True,
-        "message": "Server yaratildi!",
-        "server_id": pterodactyl_id,
-        "panel_url": f"{PTERODACTYL_URL}/server/{pterodactyl_id}"
-    })
+    content = '<div class="container"><div class="section-title"><h2>🛠 ADMIN SUPPORT</h2></div><div class="card">'
+
+    for t in tickets:
+        content += f'''
+        <div style="padding:15px;border-bottom:1px solid rgba(255,255,255,.1)">
+            🎟 #{t[0]} | 👤 {t[1]} | 📝 {t[2]} | ⚡ {t[3]}
+            <a href="/support/{t[0]}" class="btn btn-secondary" style="float:right;">Ochish</a>
+        </div>
+        '''
+
+    content += '</div></div>'
+    return render_page(content, logged_in=True, is_admin=True)
 
 
-# ===================== API: DELETE SERVER =====================
-@app.delete("/api/server/{server_id}")
-async def api_delete_server(server_id: str, session_token: Optional[str] = Cookie(None)):
-    user_id = verify_session(session_token)
-    if not user_id:
-        return JSONResponse({"success": False, "message": "Tizimga kiring!"})
-
-    conn = sqlite3.connect('hosting.db')
+@app.route('/shop')
+def shop():
+    conn = sqlite3.connect('elitemc.db')
     c = conn.cursor()
-    c.execute('SELECT * FROM servers WHERE pterodactyl_id = ? AND user_id = ?', (server_id, user_id))
-    server = c.fetchone()
+    packages = c.execute('SELECT * FROM packages WHERE is_active = 1').fetchall()
+    user_balance = 0
+    if 'user_id' in session:
+        user = c.execute('SELECT balance FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+        if user: user_balance = user[0]
+    conn.close()
+    content = f'''<div class="container"><div class="section-title" style="margin-top: 3rem;"><h2>🛒 Do'kon</h2></div>
+        {'<div class="balance-display"><h3>💰 Sizning balansingiz</h3><div class="balance-amount">' + f'{user_balance:,.0f}' + ' som</div></div>' if 'user_id' in session else ''}
+        <div class="packages">'''
+    for pkg in packages:
+        features = pkg[5].split(',')
+        features_html = ''.join([f'<li><i class="fas fa-check-circle"></i> {f.strip()}</li>' for f in features])
+        can_buy = 'user_id' in session and user_balance >= pkg[3]
+        content += f'''<div class="package-card"><div class="package-name" style="color: {pkg[6]}">{pkg[1]}</div>
+            <div class="package-price">{pkg[3]:,.0f} so'm</div><div class="package-desc">{pkg[2]}</div>
+            <ul class="package-features">{features_html}</ul><div class="package-duration"><i class="fas fa-clock"></i> Muddat: {pkg[4]} kun</div>'''
+        if 'user_id' in session:
+            if can_buy:
+                content += f'<button onclick="buyRank({pkg[0]})" class="btn btn-primary btn-full">✅ Sotib olish</button>'
+            else:
+                content += '<button disabled class="btn btn-outline btn-full" style="opacity: 0.5; cursor: not-allowed;">⚠️ Balans yetarli emas</button>'
+                content += '<a href="/balance" class="btn btn-secondary btn-full" style="margin-top: 1rem;">💳 Balans to\'ldirish</a>'
+        else:
+            content += '<a href="/login" class="btn btn-primary btn-full">🔐 Avval kirish kerak</a>'
+        content += '</div>'
+    content += '</div></div>'
+    return render_page(content, logged_in='user_id' in session, is_admin=session.get('is_admin', False))
 
-    if not server:
+
+@app.route('/buy_rank/<int:package_id>', methods=['POST'])
+@login_required
+def buy_rank(package_id):
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    package = c.execute('SELECT * FROM packages WHERE id = ?', (package_id,)).fetchone()
+    user = c.execute('SELECT balance, minecraft_nick FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+    if not package:
         conn.close()
-        return JSONResponse({"success": False, "message": "Server topilmadi!"})
-
-    c.execute('DELETE FROM servers WHERE pterodactyl_id = ?', (server_id,))
-    conn.commit()
-    conn.close()
-
-    return JSONResponse({"success": True, "message": "Server o'chirildi!"})
-
-
-# ===================== API: LOGOUT =====================
-@app.post("/api/logout")
-async def api_logout(session_token: Optional[str] = Cookie(None)):
-    if session_token:
-        conn = sqlite3.connect('hosting.db')
-        c = conn.cursor()
-        c.execute('DELETE FROM sessions WHERE session_token = ?', (session_token,))
+        return jsonify({'success': False, 'message': 'Paket topilmadi!'})
+    if not user or user[0] < package[3]:
+        conn.close()
+        return jsonify({'success': False, 'message': "Balansingizda yetarli mablag' yo'q!"})
+    minecraft_nick, new_balance = user[1], user[0] - package[3]
+    success, rcon_response = give_rank_to_player(minecraft_nick, package[1])
+    if success:
+        c.execute('UPDATE users SET balance = ? WHERE id = ?', (new_balance, session['user_id']))
+        c.execute(
+            'INSERT INTO purchases (user_id, package_id, amount, package_name, minecraft_nick) VALUES (?, ?, ?, ?, ?)',
+            (session['user_id'], package_id, package[3], package[1], minecraft_nick))
         conn.commit()
         conn.close()
+        return jsonify(
+            {'success': True, 'message': f'{package[1]} ranki muvaffaqiyatli berildi! Serverga qayta kiring.',
+             'new_balance': new_balance})
+    conn.close()
+    return jsonify({'success': False, 'message': f'Rank berishda xatolik: {rcon_response}'})
 
-    response = JSONResponse({"success": True})
-    response.delete_cookie("session_token")
-    return response
+
+@app.route('/balance')
+@login_required
+def balance():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    user = c.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+    deposits = c.execute('SELECT * FROM balance_deposits WHERE user_id = ? ORDER BY created_at DESC',
+                         (session['user_id'],)).fetchall()
+    settings = {row[1]: row[2] for row in c.execute('SELECT * FROM settings').fetchall()}
+    conn.close()
+    content = f'''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>💰 Balans</h2></div>
+        <div class="balance-display"><h3>Joriy balans</h3><div class="balance-amount">{user[5]:,.0f} so'm</div></div>
+        <div class="card"><div class="card-header"><h2>💳 Balansga pul qo'shish</h2></div>
+            <div class="alert alert-warning"><i class="fas fa-exclamation-triangle"></i><div>
+                <strong>⚠️ Diqqat!</strong> Pul o'tkazishdan oldin quyidagi ma'lumotlarni diqqat bilan o'qing.</div></div>
+            <div class="alert alert-info"><i class="fas fa-credit-card"></i><div>
+                <strong>📋 Admin karta ma'lumotlari:</strong><br>💳 Karta raqami: <strong>{settings['admin_card_number']}</strong><br>
+                👤 Egasi: <strong>{settings['admin_card_name']}</strong></div></div>
+            <form action="/deposit_balance" method="POST" enctype="multipart/form-data">
+                <div class="form-group"><label><i class="fas fa-money-bill-wave"></i> Summa (so'm)</label>
+                    <input type="number" name="amount" required min="1000" placeholder="10000"></div>
+                <div class="form-group"><label><i class="fas fa-credit-card"></i> Siz o'tkazgan karta raqami</label>
+                    <input type="text" name="card_number" required placeholder="8600 **** **** ****"></div>
+                <div class="form-group"><label><i class="fas fa-hashtag"></i> Transaksiya ID</label>
+                    <input type="text" name="transaction_id" required placeholder="TXN12345678"></div>
+                <div class="form-group"><label><i class="fas fa-camera"></i> To'lov skrinshoti (ixtiyoriy)</label>
+                    <div class="file-upload">
+                        <input type="file" name="screenshot" accept="image/*">
+                        <div class="file-upload-label"><i class="fas fa-cloud-upload-alt"></i><p>Rasm yuklash uchun bosing</p></div>
+                    </div></div>
+                <button type="submit" class="btn btn-primary btn-full">📤 So'rov yuborish</button>
+            </form></div>
+        <div class="card"><div class="card-header"><h2>📜 To'lov tarixi</h2></div><table><thead><tr>
+            <th>#</th><th>Summa</th><th>Status</th><th>Sana</th><th>Izoh</th></tr></thead><tbody>'''
+    for deposit in deposits:
+        status_class = 'pending' if deposit[6] == 'pending' else (
+            'approved' if deposit[6] == 'approved' else 'rejected')
+        status_text = '⏳ Kutilmoqda' if deposit[6] == 'pending' else (
+            '✅ Tasdiqlandi' if deposit[6] == 'approved' else '❌ Rad etildi')
+        content += f'''<tr><td>{deposit[0]}</td><td><strong>{deposit[2]:,.0f} so'm</strong></td>
+            <td><span class="badge badge-{status_class}">{status_text}</span></td>
+            <td>{deposit[8][:19]}</td><td>{deposit[7] or '-'}</td></tr>'''
+    content += '</tbody></table></div></div>'
+    return render_page(content, logged_in=True, is_admin=session.get('is_admin', False))
 
 
-if __name__ == "__main__":
-    import uvicorn
+@app.route('/deposit_balance', methods=['POST'])
+@login_required
+def deposit_balance():
+    amount, card_number, transaction_id = request.form.get('amount'), request.form.get('card_number'), request.form.get(
+        'transaction_id')
+    screenshot = None
+    if 'screenshot' in request.files:
+        file = request.files['screenshot']
+        if file and allowed_file(file.filename):
+            filename = secure_filename(f"{session['user_id']}_{datetime.datetime.now().timestamp()}_{file.filename}")
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            screenshot = f'/static/uploads/{filename}'
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO balance_deposits (user_id, amount, card_number, transaction_id, screenshot) VALUES (?, ?, ?, ?, ?)',
+        (session['user_id'], amount, card_number, transaction_id, screenshot))
+    conn.commit()
+    conn.close()
+    return redirect(url_for('balance'))
 
-    print("🎮 ThemcHost.uz ishga tushmoqda...")
-    print("🌐 Sayt: http://127.0.0.1:8000")
-    print("🔐 Login: /login")
-    print("📝 Register: /register")
-    print("📊 Dashboard: /dashboard")
-    print("⭐ Ishga tushirish: uvicorn main:app --reload")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+@app.route('/profile')
+@login_required
+def profile():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    user = c.execute('SELECT * FROM users WHERE id = ?', (session['user_id'],)).fetchone()
+    purchases = c.execute('SELECT * FROM purchases WHERE user_id = ? ORDER BY created_at DESC',
+                          (session['user_id'],)).fetchall()
+    conn.close()
+    content = f'''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>👤 Profil</h2></div>
+        <div class="card"><div class="card-header"><h2>📋 Shaxsiy ma'lumotlar</h2></div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 2rem;">
+                <div><p style="color: var(--text-dim); margin-bottom: 0.5rem;"><i class="fas fa-user"></i> Foydalanuvchi nomi</p>
+                    <h3 style="color: var(--primary);">{user[1]}</h3></div>
+                <div><p style="color: var(--text-dim); margin-bottom: 0.5rem;"><i class="fas fa-envelope"></i> Email</p>
+                    <h3 style="color: var(--primary);">{user[2]}</h3></div>
+                <div><p style="color: var(--text-dim); margin-bottom: 0.5rem;"><i class="fas fa-gamepad"></i> Minecraft nick</p>
+                    <h3 style="color: var(--primary);">{user[4]}</h3></div>
+                <div><p style="color: var(--text-dim); margin-bottom: 0.5rem;"><i class="fas fa-wallet"></i> Balans</p>
+                    <h3 style="color: var(--primary);">{user[5]:,.0f} so'm</h3></div>
+            </div></div>
+        <div class="card"><div class="card-header"><h2>🛍️ Xaridlar tarixi</h2></div>
+            {'<table><thead><tr><th>#</th><th>Paket</th><th>Summa</th><th>Sana</th><th>Status</th></tr></thead><tbody>' if purchases else '<p style="text-align: center; color: var(--text-dim); padding: 2rem;">Hali xarid qilmadingiz</p>'}'''
+    for purchase in purchases:
+        content += f'''<tr><td>{purchase[0]}</td><td><strong>{purchase[4]}</strong></td>
+            <td>{purchase[3]:,.0f} so'm</td><td>{purchase[7][:19]}</td>
+            <td><span class="badge badge-approved">✅ {purchase[6]}</span></td></tr>'''
+    if purchases: content += '</tbody></table>'
+    content += '</div></div>'
+    return render_page(content, logged_in=True, is_admin=session.get('is_admin', False))
+
+
+@app.route('/admin')
+@admin_required
+def admin_panel():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    pending_deposits = c.execute('''SELECT bd.*, u.username, u.minecraft_nick
+                                    FROM balance_deposits bd
+                                             JOIN users u ON bd.user_id = u.id
+                                    WHERE bd.status = 'pending'
+                                    ORDER BY bd.created_at DESC''').fetchall()
+    total_users = c.execute('SELECT COUNT(*) FROM users WHERE is_admin = 0').fetchone()[0]
+    total_deposits = c.execute('SELECT COUNT(*) FROM balance_deposits WHERE status = "approved"').fetchone()[0]
+    total_purchases = c.execute('SELECT COUNT(*) FROM purchases').fetchone()[0]
+    total_revenue = c.execute('SELECT SUM(amount) FROM purchases').fetchone()[0] or 0
+    conn.close()
+    content = f'''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>⚡ Admin Panel</h2></div>
+        <div class="stats">
+            <div class="stat-card"><i class="fas fa-users"></i><h3>{total_users}</h3><p>Jami foydalanuvchilar</p></div>
+            <div class="stat-card"><i class="fas fa-check-circle"></i><h3>{total_deposits}</h3><p>Tasdiqlangan to'lovlar</p></div>
+            <div class="stat-card"><i class="fas fa-shopping-cart"></i><h3>{total_purchases}</h3><p>Sotilgan paketlar</p></div>
+            <div class="stat-card"><i class="fas fa-dollar-sign"></i><h3>{total_revenue:,.0f}</h3><p>Jami daromad</p></div>
+        </div>
+        <div class="tabs">
+            <a href="/admin" class="tab active"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+            <a href="/admin/deposits?status=all" class="tab"><i class="fas fa-credit-card"></i> To'lovlar</a>
+            <a href="/admin/users" class="tab"><i class="fas fa-users"></i> Foydalanuvchilar</a>
+            <a href="/admin/settings" class="tab"><i class="fas fa-cog"></i> Sozlamalar</a>
+        </div>
+        <div class="card"><div class="card-header"><h2>⏳ Kutilayotgan to'lovlar</h2></div>
+            {'<table><thead><tr><th>#</th><th>Foydalanuvchi</th><th>Summa</th><th>Karta</th><th>TXN ID</th><th>Sana</th><th>Amallar</th></tr></thead><tbody>' if pending_deposits else '<p style="text-align: center; color: var(--text-dim); padding: 2rem;">Kutilayotgan tolovlar yoq</p>'}'''
+    for deposit in pending_deposits:
+        screenshot_btn = f'<a href="{deposit[5]}" target="_blank" class="btn btn-outline" style="padding: 0.5rem 1rem; font-size: 0.9rem;">🖼️ Skrinshot</a>' if \
+        deposit[5] else ''
+        content += f'''<tr><td>{deposit[0]}</td><td><strong>{deposit[11]}</strong> ({deposit[12]})</td>
+            <td>{deposit[2]:,.0f} so'm</td><td>{deposit[3]}</td><td>{deposit[4]}</td><td>{deposit[8][:19]}</td>
+            <td>{screenshot_btn}
+                <button onclick="approveDeposit({deposit[0]})" class="btn btn-primary" style="padding: 0.5rem 1rem; font-size: 0.9rem;">✅ Tasdiqlash</button>
+                <button onclick="rejectDeposit({deposit[0]})" class="btn btn-secondary" style="padding: 0.5rem 1rem; font-size: 0.9rem;">❌ Rad etish</button>
+            </td></tr>'''
+    if pending_deposits: content += '</tbody></table>'
+    content += '</div></div>'
+    return render_page(content, logged_in=True, is_admin=True)
+
+
+@app.route('/admin/approve_deposit/<int:deposit_id>', methods=['POST'])
+@admin_required
+def approve_deposit(deposit_id):
+    data = request.json
+    comment = data.get('comment', '')
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    deposit = c.execute('SELECT * FROM balance_deposits WHERE id = ?', (deposit_id,)).fetchone()
+    if deposit and deposit[6] == 'pending':
+        c.execute('UPDATE users SET balance = balance + ? WHERE id = ?', (deposit[2], deposit[1]))
+        c.execute(
+            'UPDATE balance_deposits SET status = ?, admin_comment = ?, processed_at = ?, processed_by = ? WHERE id = ?',
+            ('approved', comment, datetime.datetime.now(), session['user_id'], deposit_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': "To'lov tasdiqlandi!"})
+    conn.close()
+    return jsonify({'success': False, 'message': 'Xatolik yuz berdi!'})
+
+
+@app.route('/admin/reject_deposit/<int:deposit_id>', methods=['POST'])
+@admin_required
+def reject_deposit(deposit_id):
+    data = request.json
+    comment = data.get('comment', '')
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    deposit = c.execute('SELECT * FROM balance_deposits WHERE id = ?', (deposit_id,)).fetchone()
+    if deposit and deposit[6] == 'pending':
+        c.execute(
+            'UPDATE balance_deposits SET status = ?, admin_comment = ?, processed_at = ?, processed_by = ? WHERE id = ?',
+            ('rejected', comment, datetime.datetime.now(), session['user_id'], deposit_id))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': "To'lov rad etildi!"})
+    conn.close()
+    return jsonify({'success': False, 'message': 'Xatolik yuz berdi!'})
+
+
+@app.route('/admin/deposits')
+@admin_required
+def admin_deposits():
+    status_filter = request.args.get('status', 'all')
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    if status_filter == 'all':
+        deposits = c.execute('''SELECT bd.*, u.username
+                                FROM balance_deposits bd
+                                         JOIN users u ON bd.user_id = u.id
+                                ORDER BY bd.created_at DESC''').fetchall()
+    else:
+        deposits = c.execute('''SELECT bd.*, u.username
+                                FROM balance_deposits bd
+                                         JOIN users u ON bd.user_id = u.id
+                                WHERE bd.status = ?
+                                ORDER BY bd.created_at DESC''', (status_filter,)).fetchall()
+    conn.close()
+    content = f'''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>💳 Barcha to'lovlar</h2></div>
+        <div class="tabs">
+            <a href="/admin" class="tab"><i class="fas fa-tachometer-alt"></i> Dashboard</a>
+            <a href="/admin/deposits?status=all" class="tab {'active' if status_filter == 'all' else ''}">Barchasi</a>
+            <a href="/admin/deposits?status=pending" class="tab {'active' if status_filter == 'pending' else ''}">⏳ Kutilmoqda</a>
+            <a href="/admin/deposits?status=approved" class="tab {'active' if status_filter == 'approved' else ''}">✅ Tasdiqlangan</a>
+            <a href="/admin/deposits?status=rejected" class="tab {'active' if status_filter == 'rejected' else ''}">❌ Rad etilgan</a>
+        </div>
+        <div class="card"><table><thead><tr><th>#</th><th>Foydalanuvchi</th><th>Summa</th><th>Karta</th><th>Status</th><th>Sana</th><th>Amallar</th></tr></thead><tbody>'''
+    for deposit in deposits:
+        status_class = 'pending' if deposit[6] == 'pending' else (
+            'approved' if deposit[6] == 'approved' else 'rejected')
+        status_text = '⏳ Kutilmoqda' if deposit[6] == 'pending' else (
+            '✅ Tasdiqlandi' if deposit[6] == 'approved' else '❌ Rad etildi')
+        screenshot_btn = f'<a href="{deposit[5]}" target="_blank" class="btn btn-outline" style="padding: 0.5rem; font-size: 0.9rem;">🖼️</a>' if \
+        deposit[5] else ''
+        content += f'''<tr><td>{deposit[0]}</td><td><strong>{deposit[11]}</strong></td><td>{deposit[2]:,.0f} so'm</td>
+            <td>{deposit[3]}</td><td><span class="badge badge-{status_class}">{status_text}</span></td>
+            <td>{deposit[8][:19]}</td><td>{screenshot_btn}</td></tr>'''
+    content += '</tbody></table></div></div>'
+    return render_page(content, logged_in=True, is_admin=True)
+
+@app.route('/admin/support')
+@admin_required
+def admin_support():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+
+    tickets = c.execute("""
+        SELECT support_tickets.id, users.username, subject, status 
+        FROM support_tickets 
+        JOIN users ON users.id = support_tickets.user_id
+        ORDER BY created_at DESC
+    """).fetchall()
+
+    conn.close()
+
+    content = '<div class="container"><div class="section-title"><h2>🛠 ADMIN SUPPORT</h2></div><div class="card">'
+
+    for t in tickets:
+        content += f'''
+        <div style="padding:15px;border-bottom:1px solid rgba(255,255,255,.1)">
+            🎟 #{t[0]} | 👤 {t[1]} | 📝 {t[2]} | ⚡ {t[3]}
+            <a href="/support/{t[0]}" class="btn btn-secondary" style="float:right;">Ochish</a>
+        </div>
+        '''
+
+    content += '</div></div>'
+    return render_page(content, logged_in=True, is_admin=True)
+
+
+
+@app.route('/admin/users')
+@admin_required
+def admin_users():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    users = c.execute('SELECT * FROM users ORDER BY created_at DESC').fetchall()
+    conn.close()
+    content = '''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>👥 Foydalanuvchilar</h2></div>
+        <div class="tabs"><a href="/admin" class="tab"><i class="fas fa-tachometer-alt"></i> Dashboard</a></div>
+        <div class="card"><table><thead><tr><th>#</th><th>Username</th><th>Email</th><th>Minecraft</th><th>Balans</th><th>Admin</th><th>Ro'yxat</th></tr></thead><tbody>'''
+    for user in users:
+        content += f'''<tr><td>{user[0]}</td><td><strong>{user[1]}</strong></td><td>{user[2]}</td>
+            <td>{user[4]}</td><td>{user[5]:,.0f} so'm</td><td>{'✅' if user[6] else '❌'}</td><td>{user[7][:19]}</td></tr>'''
+    content += '</tbody></table></div></div>'
+    return render_page(content, logged_in=True, is_admin=True)
+
+
+@app.route('/admin/settings', methods=['GET', 'POST'])
+@admin_required
+def admin_settings():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    if request.method == 'POST':
+        data = request.json
+        for key, value in data.items():
+            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'message': 'Sozlamalar saqlandi!'})
+    settings = {row[1]: row[2] for row in c.execute('SELECT * FROM settings').fetchall()}
+    conn.close()
+    content = f'''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>⚙️ Sozlamalar</h2></div>
+        <div class="tabs"><a href="/admin" class="tab"><i class="fas fa-tachometer-alt"></i> Dashboard</a></div>
+        <div class="card"><div class="card-header"><h2>💳 Admin karta ma'lumotlari</h2></div>
+            <form id="settingsForm">
+                <div class="form-group"><label><i class="fas fa-credit-card"></i> Karta raqami</label>
+                    <input type="text" name="admin_card_number" value="{settings.get('admin_card_number', '')}" required></div>
+                <div class="form-group"><label><i class="fas fa-user"></i> Karta egasi</label>
+                    <input type="text" name="admin_card_name" value="{settings.get('admin_card_name', '')}" required></div>
+            </form></div>
+        <div class="card"><div class="card-header"><h2>🌐 Sayt sozlamalari</h2></div>
+            <div class="form-group"><label><i class="fas fa-globe"></i> Sayt nomi</label>
+                <input type="text" name="site_name" value="{settings.get('site_name', '')}" form="settingsForm" required></div>
+            <div class="form-group"><label><i class="fas fa-server"></i> Server IP</label>
+                <input type="text" name="server_ip" value="{settings.get('server_ip', '')}" form="settingsForm" required></div>
+        </div>
+        <div class="card"><div class="card-header"><h2>🎮 RCON sozlamalari</h2></div>
+            <div class="form-group"><label><i class="fas fa-network-wired"></i> RCON Host</label>
+                <input type="text" name="rcon_host" value="{settings.get('rcon_host', '')}" form="settingsForm" required></div>
+            <div class="form-group"><label><i class="fas fa-plug"></i> RCON Port</label>
+                <input type="number" name="rcon_port" value="{settings.get('rcon_port', '')}" form="settingsForm" required></div>
+            <div class="form-group"><label><i class="fas fa-key"></i> RCON Parol</label>
+                <input type="password" name="rcon_password" value="{settings.get('rcon_password', '')}" form="settingsForm" required></div>
+        </div>
+        <div class="card"><div class="card-header"><h2>📱 Ijtimoiy tarmoqlar</h2></div>
+            <div class="form-group"><label><i class="fab fa-discord"></i> Discord Link</label>
+                <input type="url" name="discord_link" value="{settings.get('discord_link', '')}" form="settingsForm" placeholder="https://discord.gg/..."></div>
+            <div class="form-group"><label><i class="fab fa-instagram"></i> Instagram Link</label>
+                <input type="url" name="instagram_link" value="{settings.get('instagram_link', '')}" form="settingsForm" placeholder="https://instagram.com/..."></div>
+            <div class="form-group"><label><i class="fab fa-telegram"></i> Telegram Link</label>
+                <input type="url" name="telegram_link" value="{settings.get('telegram_link', '')}" form="settingsForm" placeholder="https://t.me/..."></div>
+            <div class="form-group"><label><i class="fab fa-youtube"></i> YouTube Link</label>
+                <input type="url" name="youtube_link" value="{settings.get('youtube_link', '')}" form="settingsForm" placeholder="https://youtube.com/@..."></div>
+        </div>
+        <button onclick="saveSettings()" class="btn btn-primary btn-full">💾 Saqlash</button>
+    </div>'''
+    return render_page(content, logged_in=True, is_admin=True)
+
+
+@app.route('/static/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+
+@app.route('/api/stats')
+def stats():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    total_users = c.execute('SELECT COUNT(*) FROM users WHERE is_admin = 0').fetchone()[0]
+    total_purchases = c.execute('SELECT COUNT(*) FROM purchases').fetchone()[0]
+    total_revenue = c.execute('SELECT SUM(amount) FROM purchases').fetchone()[0] or 0
+    conn.close()
+    return jsonify({'total_users': total_users, 'total_purchases': total_purchases, 'total_revenue': total_revenue})
+
+
+# ---------------- SUPPORT SYSTEM START ----------------
+
+@app.route('/support')
+@login_required
+def support():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    # Foydalanuvchining barcha ticketlari
+    tickets = c.execute('''SELECT *
+                           FROM support_tickets
+                           WHERE user_id = ?
+                           ORDER BY created_at DESC''',
+                        (session['user_id'],)).fetchall()
+    conn.close()
+
+    content = f'''<div class="container" style="margin-top: 3rem; margin-bottom: 3rem;">
+        <div class="section-title"><h2>🛠️ Yordam Markazi</h2></div>
+        <div class="card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+                <h3>Mening murojaatlarim</h3>
+                <a href="/support/new" class="btn btn-primary"><i class="fas fa-plus"></i> Yangi ochish</a>
+            </div>
+            <table>
+                <thead><tr><th>ID</th><th>Mavzu</th><th>Holat</th><th>Sana</th><th>Amal</th></tr></thead>
+                <tbody>'''
+
+    if not tickets:
+        content += '<tr><td colspan="5" style="text-align:center;">Murojaatlar mavjud emas</td></tr>'
+
+    for t in tickets:
+        status_color = "success" if t[3] == 'open' else ("warning" if t[3] == 'answered' else "danger")
+        status_text = "Ochiq" if t[3] == 'open' else ("Javob berildi" if t[3] == 'answered' else "Yopilgan")
+
+        content += f'''<tr>
+            <td>#{t[0]}</td>
+            <td><strong>{t[2]}</strong></td>
+            <td><span class="badge" style="border:1px solid var(--{status_color}); color:var(--{status_color})">{status_text}</span></td>
+            <td>{t[4][:16]}</td>
+            <td><a href="/support/{t[0]}" class="btn btn-outline" style="padding:5px 10px;">👁️ Ko'rish</a></td>
+        </tr>'''
+
+    content += '''</tbody></table></div></div>'''
+    return render_page(content, logged_in=True, is_admin=session.get('is_admin', False))
+
+
+@app.route('/support/new', methods=['GET', 'POST'])
+@login_required
+def new_ticket():
+    if request.method == 'POST':
+        subject = request.form.get('subject')
+        message = request.form.get('message')
+
+        conn = sqlite3.connect('elitemc.db')
+        c = conn.cursor()
+        # Ticket yaratish
+        c.execute('INSERT INTO support_tickets (user_id, subject) VALUES (?, ?)', (session['user_id'], subject))
+        ticket_id = c.lastrowid
+        # Birinchi xabarni yozish
+        c.execute('INSERT INTO support_messages (ticket_id, user_id, message) VALUES (?, ?, ?)',
+                  (ticket_id, session['user_id'], message))
+        conn.commit()
+        conn.close()
+        return redirect(url_for('view_ticket', ticket_id=ticket_id))
+
+    content = '''<div class="container" style="max-width: 800px; margin-top: 3rem;">
+        <div class="card">
+            <div class="card-header"><h2>📝 Yangi murojaat</h2></div>
+            <form method="POST">
+                <div class="form-group">
+                    <label>Mavzu</label>
+                    <input type="text" name="subject" required placeholder="Masalan: To'lov o'tmadi...">
+                </div>
+                <div class="form-group">
+                    <label>Xabar matni</label>
+                    <textarea name="message" rows="5" required placeholder="Muammoni batafsil yozing..."></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Yuborish</button>
+                <a href="/support" class="btn btn-outline">Bekor qilish</a>
+            </form>
+        </div>
+    </div>'''
+    return render_page(content, logged_in=True, is_admin=session.get('is_admin', False))
+
+
+@app.route('/support/<int:ticket_id>', methods=['GET', 'POST'])
+@login_required
+def view_ticket(ticket_id):
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+
+    # Xabar yuborish
+    if request.method == 'POST':
+        message = request.form.get('message')
+        is_admin = 1 if session.get('is_admin') else 0
+        c.execute('INSERT INTO support_messages (ticket_id, user_id, message, is_admin_reply) VALUES (?, ?, ?, ?)',
+                  (ticket_id, session['user_id'], message, is_admin))
+        # Statusni yangilash
+        new_status = 'answered' if is_admin else 'open'
+        c.execute('UPDATE support_tickets SET status = ? WHERE id = ?', (new_status, ticket_id))
+        conn.commit()
+
+    ticket = c.execute('SELECT * FROM support_tickets WHERE id = ?', (ticket_id,)).fetchone()
+
+    # Xavfsizlik: faqat egasi yoki admin ko'ra oladi
+    if not ticket or (ticket[1] != session['user_id'] and not session.get('is_admin')):
+        conn.close()
+        return redirect(url_for('support'))
+
+    messages = c.execute('''SELECT sm.*, u.username
+                            FROM support_messages sm
+                                     JOIN users u ON sm.user_id = u.id
+                            WHERE ticket_id = ?
+                            ORDER BY sm.created_at ASC''', (ticket_id,)).fetchall()
+    conn.close()
+
+    chat_html = ''
+    for msg in messages:
+        # Kim yozganini aniqlash (chap yoki o'ng tomon)
+        align = 'flex-end' if msg[2] == session['user_id'] else 'flex-start'
+        bg_color = 'var(--primary)' if msg[2] == session['user_id'] else 'var(--dark-hover)'
+        text_color = '#000' if msg[2] == session['user_id'] else 'var(--text)'
+        border = 'none' if msg[2] == session['user_id'] else '1px solid var(--primary)'
+
+        chat_html += f'''
+        <div style="display:flex; justify-content:{align}; margin-bottom:1rem;">
+            <div style="max-width:70%; background:{bg_color}; color:{text_color}; padding:1rem; border-radius:15px; border:{border}">
+                <div style="font-size:0.8rem; opacity:0.7; margin-bottom:5px;">{msg[6]} • {msg[5][:16]}</div>
+                {msg[3]}
+            </div>
+        </div>
+        '''
+
+    content = f'''<div class="container" style="max-width: 900px; margin-top: 3rem;">
+        <div class="card">
+            <div class="card-header" style="display:flex; justify-content:space-between;">
+                <h2>🎫 Ticket #{ticket[0]}: {ticket[2]}</h2>
+                <a href="/support" class="btn btn-outline">Orqaga</a>
+            </div>
+            <div style="height: 400px; overflow-y: auto; padding: 1rem; background: rgba(0,0,0,0.2); border-radius: 10px; margin-bottom: 1rem; display: flex; flex-direction: column;">
+                {chat_html}
+            </div>
+            <form method="POST" style="display:flex; gap:1rem;">
+                <input type="text" name="message" required placeholder="Xabar yozing..." style="flex:1;">
+                <button type="submit" class="btn btn-primary"><i class="fas fa-paper-plane"></i></button>
+            </form>
+        </div>
+    </div>'''
+    return render_page(content, logged_in=True, is_admin=session.get('is_admin', False))
+
+
+@app.route('/admin/support')
+@admin_required
+def admin_support_list():
+    conn = sqlite3.connect('elitemc.db')
+    c = conn.cursor()
+    tickets = c.execute('''SELECT st.*, u.username
+                           FROM support_tickets st
+                                    JOIN users u ON st.user_id = u.id
+                           ORDER BY CASE WHEN st.status = 'open' THEN 0 ELSE 1 END, st.created_at DESC''').fetchall()
+    conn.close()
+
+    content = f'''<div class="container" style="margin-top: 3rem;">
+        <div class="section-title"><h2>⚡ Admin Support</h2></div>
+        <div class="tabs"><a href="/admin" class="tab"><i class="fas fa-tachometer-alt"></i> Dashboard</a></div>
+        <div class="card">
+            <table>
+                <thead><tr><th>ID</th><th>User</th><th>Mavzu</th><th>Holat</th><th>Amal</th></tr></thead>
+                <tbody>'''
+    for t in tickets:
+        status_badge = 'badge-rejected' if t[3] == 'closed' else (
+            'badge-pending' if t[3] == 'open' else 'badge-approved')
+        content += f'''<tr>
+            <td>#{t[0]}</td>
+            <td>{t[5]}</td>
+            <td>{t[2]}</td>
+            <td><span class="badge {status_badge}">{t[3]}</span></td>
+            <td><a href="/support/{t[0]}" class="btn btn-primary">Javob berish</a></td>
+        </tr>'''
+    content += '</tbody></table></div></div>'
+    return render_page(content, logged_in=True, is_admin=True)
+
+
+# ---------------- SUPPORT SYSTEM END ----------------
+
+if __name__ == '__main__':
+    init_db()
+    print("=" * 60)
+    print("🎮 EliteMC.uz Auto Donate Sayti ishga tushdi!")
+    print("=" * 60)
+    print("📍 URL: http://localhost:5000")
+    print("👤 Admin: admin")
+    print("🔒 Parol: admin123")
+    print("=" * 60)
+    print("⚠️ MCRCON sozlamalarini /admin/settings dan to'ldiring!")
+    print("=" * 60)
+    app.run(debug=True, host='0.0.0.0', port=5000)
