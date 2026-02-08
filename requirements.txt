@@ -1,1 +1,6 @@
-pip install fastapi uvicorn requests python-multipart
+Flask==2.3.3
+gunicorn==21.2.0
+requests
+mcrcon
+werkzeug
+
